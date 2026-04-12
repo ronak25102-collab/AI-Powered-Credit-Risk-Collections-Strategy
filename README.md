@@ -77,6 +77,7 @@ This project simulates a real-world credit analytics workflow:
 - `POST /portfolio/workflow/auto`
   - Runs rule-based workflow automation for high-risk-only or full-queue scope.
   - Auto-assigns owners, advances workflow status, schedules follow-ups, and writes timeline audit events.
+  - Returns summary counters including `matched_scope`, `updated`, and `already_orchestrated`.
 - `POST /portfolio/batch-score`
   - Uploads CSV/XLSX borrower files and returns scored rows with risk band summary.
 - `GET /alerts`
@@ -122,6 +123,7 @@ frontend/
 - Risk Queue performance is optimized with server-side filtering/pagination and debounced search input.
 - Risk Queue includes Auto-Orchestrate controls:
   - Run automation for high-risk-only or entire queue scope
+  - Preview policy impact before applying workflow updates
   - Auto-balance owner assignment across agent pool
   - Auto-escalate severe accounts and schedule policy-based follow-ups
 - Borrower timeline panel includes:

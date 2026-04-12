@@ -120,6 +120,8 @@ export default function RiskQueue() {
   const [automationScope, setAutomationScope] = useState("high");
   const [automationLoading, setAutomationLoading] = useState(false);
   const [automationSummary, setAutomationSummary] = useState(null);
+  const [automationPreviewRows, setAutomationPreviewRows] = useState([]);
+  const [automationRunMode, setAutomationRunMode] = useState(null);
 
   function mergeUpdatedRecord(updatedRecord) {
     setPortfolio((previous) => {
@@ -164,6 +166,9 @@ export default function RiskQueue() {
       if (response.record) {
         mergeUpdatedRecord(response.record);
       }
+      if (response.updated) {
+        setReloadTick((previous) => previous + 1);
+      }
     } catch (apiError) {
       setError(apiError.message || "Unable to update workflow.");
     } finally {
@@ -190,9 +195,11 @@ export default function RiskQueue() {
     }
   }
 
-  async function runAutoWorkflow() {
+  async function runAutoWorkflow(dryRun = false) {
     setAutomationLoading(true);
+    setAutomationRunMode(dryRun ? "preview" : "apply");
     setAutomationSummary(null);
+    setAutomationPreviewRows([]);
     setError("");
 
     try {
@@ -200,15 +207,19 @@ export default function RiskQueue() {
         scope: automationScope,
         limit: 10000,
         include_snoozed: false,
-        dry_run: false,
+        dry_run: dryRun,
       });
 
       setAutomationSummary(automationResponse.summary || null);
-      setReloadTick((previous) => previous + 1);
+      setAutomationPreviewRows((automationResponse.preview || []).slice(0, 6));
+      if (!dryRun) {
+        setReloadTick((previous) => previous + 1);
+      }
     } catch (apiError) {
       setError(apiError.message || "Unable to run automated workflow.");
     } finally {
       setAutomationLoading(false);
+      setAutomationRunMode(null);
     }
   }
 
@@ -484,14 +495,23 @@ export default function RiskQueue() {
           <button
             type="button"
             className="btn-secondary rounded-xl px-4 py-2.5"
-            onClick={runAutoWorkflow}
+            onClick={() => runAutoWorkflow(true)}
             disabled={automationLoading}
           >
-            {automationLoading ? "Running Automation..." : "Auto-Orchestrate"}
+            {automationLoading && automationRunMode === "preview" ? "Previewing..." : "Preview Plan"}
+          </button>
+
+          <button
+            type="button"
+            className="btn-primary rounded-xl px-4 py-2.5"
+            onClick={() => runAutoWorkflow(false)}
+            disabled={automationLoading}
+          >
+            {automationLoading && automationRunMode === "apply" ? "Applying..." : "Apply Automation"}
           </button>
 
           <p className="text-xs text-[#7a665b]">
-            Automation auto-assigns owners, advances status, and schedules follow-ups using risk policy rules.
+            Preview simulates changes first; Apply executes automation and updates workflow state.
           </p>
         </div>
 
@@ -501,6 +521,9 @@ export default function RiskQueue() {
           <span className="metric-chip">High: {Number(riskCounts.high || 0).toLocaleString()}</span>
           <span className="metric-chip">Medium: {Number(riskCounts.medium || 0).toLocaleString()}</span>
           <span className="metric-chip">Low: {Number(riskCounts.low || 0).toLocaleString()}</span>
+          <span className="metric-chip">Assigned: {Number(workflowCounts.assigned || 0).toLocaleString()}</span>
+          <span className="metric-chip">In Progress: {Number(workflowCounts.in_progress || 0).toLocaleString()}</span>
+          <span className="metric-chip">Escalated: {Number(workflowCounts.escalated || 0).toLocaleString()}</span>
           <span className="metric-chip">Contacted: {Number(workflowCounts.contacted || 0).toLocaleString()}</span>
           <span className="metric-chip">Snoozed: {Number(workflowCounts.snoozed || 0).toLocaleString()}</span>
           <span className="metric-chip">Resolved: {Number(workflowCounts.resolved || 0).toLocaleString()}</span>
@@ -509,13 +532,39 @@ export default function RiskQueue() {
 
         {automationSummary ? (
           <div className="mt-3 flex flex-wrap gap-2 rounded-xl border border-orange-300/35 bg-orange-100/65 px-3 py-3 text-xs text-[#6a5448]">
+            <span className="metric-chip">Mode: {automationSummary.dry_run ? "Preview" : "Applied"}</span>
+            <span className="metric-chip">Matched Scope: {automationSummary.matched_scope}</span>
             <span className="metric-chip">Evaluated: {automationSummary.evaluated}</span>
             <span className="metric-chip">Updated: {automationSummary.updated}</span>
             <span className="metric-chip">Assigned: {automationSummary.assigned}</span>
             <span className="metric-chip">Escalated: {automationSummary.escalated}</span>
             <span className="metric-chip">Follow-Ups: {automationSummary.followups_scheduled}</span>
             <span className="metric-chip">Snoozed: {automationSummary.snoozed}</span>
-            <span className="metric-chip">Unchanged: {automationSummary.unchanged}</span>
+            <span className="metric-chip">Already Orchestrated: {automationSummary.already_orchestrated ?? automationSummary.unchanged}</span>
+            {automationSummary.updated === 0 && automationSummary.evaluated > 0 ? (
+              <span className="metric-chip">No changes required in current scope</span>
+            ) : null}
+          </div>
+        ) : null}
+
+        {automationPreviewRows.length ? (
+          <div className="mt-3 rounded-xl border border-orange-300/30 bg-[#fff8f2] p-3">
+            <p className="mb-2 text-xs font-semibold uppercase tracking-[0.08em] text-[#7b5d4f]">
+              Automation Preview (top {automationPreviewRows.length})
+            </p>
+            <div className="grid gap-2">
+              {automationPreviewRows.map((row) => (
+                <div key={`${row.account_id}-${row.status}-${row.changed}`} className="rounded-lg border border-[#ecd8ca] bg-white/80 px-3 py-2 text-xs text-[#6b5549]">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <p className="font-semibold">{row.account_id} | {row.status}</p>
+                    <span className={`badge ${row.changed ? "badge-medium" : "badge-low"}`}>
+                      {row.changed ? "change" : "aligned"}
+                    </span>
+                  </div>
+                  <p className="mt-1">{row.reason}</p>
+                </div>
+              ))}
+            </div>
           </div>
         ) : null}
       </GlassCard>

@@ -1338,12 +1338,15 @@ def auto_orchestrate_portfolio_workflow(
         ]
 
     candidate_records.sort(key=lambda item: float(item.get("risk_score", 0.0)), reverse=True)
+    matched_scope_count = len(candidate_records)
 
     summary = {
         "scope": request.scope,
+        "matched_scope": matched_scope_count,
         "evaluated": 0,
         "updated": 0,
         "unchanged": 0,
+        "already_orchestrated": 0,
         "skipped_snoozed": 0,
         "assigned": 0,
         "escalated": 0,
@@ -1372,6 +1375,21 @@ def auto_orchestrate_portfolio_workflow(
         plan = _plan_automated_workflow_update(record, owner_load)
         if not plan["changed"]:
             summary["unchanged"] += 1
+            summary["already_orchestrated"] += 1
+
+            if len(preview) < 80:
+                preview.append(
+                    {
+                        "account_id": str(record.get("account_id")),
+                        "risk_category": str(record.get("risk_category", "low")),
+                        "risk_score": float(record.get("risk_score", 0.0)),
+                        "owner": str(record.get("assigned_to") or ""),
+                        "status": str(record.get("workflow_status", "new")),
+                        "follow_up_at": record.get("follow_up_at"),
+                        "reason": "already aligned with automation policy",
+                        "changed": False,
+                    }
+                )
             continue
 
         previous_owner = str(record.get("assigned_to") or "").strip() or None
@@ -1388,17 +1406,19 @@ def auto_orchestrate_portfolio_workflow(
         if plan["status"] == "snoozed" and previous_status != "snoozed":
             summary["snoozed"] += 1
 
-        preview.append(
-            {
-                "account_id": str(record.get("account_id")),
-                "risk_category": str(record.get("risk_category", "low")),
-                "risk_score": float(record.get("risk_score", 0.0)),
-                "owner": plan["owner"],
-                "status": plan["status"],
-                "follow_up_at": plan["follow_up_at"],
-                "reason": plan["reason"],
-            }
-        )
+        if len(preview) < 80:
+            preview.append(
+                {
+                    "account_id": str(record.get("account_id")),
+                    "risk_category": str(record.get("risk_category", "low")),
+                    "risk_score": float(record.get("risk_score", 0.0)),
+                    "owner": plan["owner"],
+                    "status": plan["status"],
+                    "follow_up_at": plan["follow_up_at"],
+                    "reason": plan["reason"],
+                    "changed": True,
+                }
+            )
 
         if request.dry_run:
             continue
@@ -1436,7 +1456,7 @@ def auto_orchestrate_portfolio_workflow(
 
     return {
         "summary": summary,
-        "preview": preview[:80],
+        "preview": preview,
         "generated_at": _utc_now_iso(),
     }
 
