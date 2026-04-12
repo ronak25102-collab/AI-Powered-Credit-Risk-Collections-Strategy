@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional
@@ -33,6 +33,7 @@ WORKFLOW_STATUS_VALUES = {
     "escalated",
     "resolved",
 }
+AUTO_WORKFLOW_OWNER_POOL = ("Agent Prime", "Agent Nova", "Agent Delta", "Agent Orion")
 
 ROLE_PERMISSIONS: Dict[str, set[str]] = {
     "analyst": {"read", "predict"},
@@ -93,6 +94,13 @@ class WorkflowUpdateRequest(BaseModel):
     follow_up_at: Optional[datetime] = None
     snoozed_until: Optional[datetime] = None
     note: Optional[str] = Field(default=None, min_length=1, max_length=500)
+
+
+class WorkflowAutomationRequest(BaseModel):
+    scope: Literal["high", "all"] = "high"
+    limit: int = Field(default=2000, ge=1, le=10000)
+    include_snoozed: bool = False
+    dry_run: bool = False
 
 
 class ModelPromotionRequest(BaseModel):
@@ -300,6 +308,118 @@ def _portfolio_action_recommendation(record: Dict[str, Any]) -> str:
     if record["risk_category"] == "medium":
         return "Schedule proactive reminder and monitor payment behavior weekly."
     return "Keep on standard monitoring cadence."
+
+
+def _build_auto_owner_load(records: list[Dict[str, Any]]) -> Dict[str, int]:
+    owner_load = {owner: 0 for owner in AUTO_WORKFLOW_OWNER_POOL}
+    for record in records:
+        if str(record.get("workflow_status", "new")) == "resolved":
+            continue
+
+        owner = str(record.get("assigned_to") or "").strip()
+        if owner in owner_load:
+            owner_load[owner] += 1
+
+    return owner_load
+
+
+def _pick_auto_owner(owner_load: Dict[str, int]) -> str:
+    selected_owner = min(owner_load.items(), key=lambda item: (item[1], item[0]))[0]
+    owner_load[selected_owner] += 1
+    return selected_owner
+
+
+def _future_iso(days: int = 0, hours: int = 0) -> str:
+    return (datetime.now(timezone.utc) + timedelta(days=days, hours=hours)).isoformat()
+
+
+def _plan_automated_workflow_update(
+    record: Dict[str, Any],
+    owner_load: Dict[str, int],
+) -> Dict[str, Any]:
+    now = datetime.now(timezone.utc)
+
+    current_owner = str(record.get("assigned_to") or "").strip() or None
+    current_status = str(record.get("workflow_status", "new"))
+    current_follow_up = record.get("follow_up_at") if isinstance(record.get("follow_up_at"), str) else None
+    current_snoozed_until = (
+        record.get("snoozed_until") if isinstance(record.get("snoozed_until"), str) else None
+    )
+
+    risk_category = str(record.get("risk_category", "low"))
+    risk_score = float(record.get("risk_score", 0.0))
+    missed_payments = int(record.get("missed_payments", 0))
+    follow_up_dt = _parse_datetime(current_follow_up)
+    needs_follow_up = follow_up_dt is None or follow_up_dt <= now
+
+    next_owner = current_owner
+    next_status = current_status
+    next_follow_up = current_follow_up
+    next_snoozed_until = current_snoozed_until
+    reasons: list[str] = []
+
+    if current_status == "resolved":
+        return {
+            "changed": False,
+            "owner": current_owner,
+            "status": current_status,
+            "follow_up_at": current_follow_up,
+            "snoozed_until": current_snoozed_until,
+            "reason": "already resolved",
+        }
+
+    if next_owner is None and risk_category in {"high", "medium"}:
+        next_owner = _pick_auto_owner(owner_load)
+        reasons.append("owner balanced")
+
+    if risk_category == "high":
+        next_snoozed_until = None
+        if risk_score >= 82.0 or missed_payments >= 5:
+            if current_status in {"new", "assigned", "in_progress", "snoozed"}:
+                next_status = "escalated"
+                reasons.append("escalation policy")
+            if needs_follow_up:
+                next_follow_up = _future_iso(hours=24)
+                reasons.append("24h follow-up")
+        else:
+            if current_status in {"new", "assigned", "snoozed"}:
+                next_status = "in_progress"
+                reasons.append("active outreach")
+            if needs_follow_up:
+                next_follow_up = _future_iso(days=2)
+                reasons.append("48h follow-up")
+
+    elif risk_category == "medium":
+        next_snoozed_until = None
+        if current_status in {"new", "snoozed"}:
+            next_status = "assigned"
+            reasons.append("preventive assignment")
+        if needs_follow_up:
+            next_follow_up = _future_iso(days=5)
+            reasons.append("weekly monitoring")
+
+    else:
+        if current_status in {"new", "assigned", "in_progress"} and current_follow_up is None:
+            next_status = "snoozed"
+            next_snoozed_until = _future_iso(days=14)
+            next_follow_up = None
+            reasons.append("low-risk snooze")
+
+    changed = (
+        next_owner != current_owner
+        or next_status != current_status
+        or next_follow_up != current_follow_up
+        or next_snoozed_until != current_snoozed_until
+    )
+
+    return {
+        "changed": changed,
+        "owner": next_owner,
+        "status": next_status,
+        "follow_up_at": next_follow_up,
+        "snoozed_until": next_snoozed_until,
+        "reason": ", ".join(reasons) if reasons else "automation rules",
+    }
 
 
 def _append_timeline_event(
@@ -634,6 +754,33 @@ def _build_portfolio_records(model: CreditRiskModel, dataset: pd.DataFrame) -> l
     return records
 
 
+def _build_risk_decile_rows(records: list[Dict[str, Any]], bucket_count: int = 10) -> list[Dict[str, Any]]:
+    rows = [
+        {
+            "label": str(index + 1).zfill(2),
+            "low": 0,
+            "medium": 0,
+            "high": 0,
+        }
+        for index in range(bucket_count)
+    ]
+
+    if not records:
+        return rows
+
+    sorted_records = sorted(records, key=lambda item: float(item.get("risk_score", 0.0)))
+    bucket_size = max(1, (len(sorted_records) + bucket_count - 1) // bucket_count)
+
+    for index, record in enumerate(sorted_records):
+        bucket_index = min(bucket_count - 1, index // bucket_size)
+        category = str(record.get("risk_category", "low")).lower()
+        if category not in {"low", "medium", "high"}:
+            category = "low"
+        rows[bucket_index][category] += 1
+
+    return rows
+
+
 @app.on_event("startup")
 def startup_event() -> None:
     dataset_path = os.getenv("CREDIT_RISK_DATASET")
@@ -724,7 +871,9 @@ def get_portfolio(
         pattern="^(new|assigned|in_progress|contacted|promise_to_pay|snoozed|escalated|resolved)$",
     ),
     search: Optional[str] = None,
-    limit: int = Query(default=200, ge=1, le=1000),
+    summary_mode: Literal["full", "light"] = Query(default="full"),
+    limit: int = Query(default=200, ge=1, le=10000),
+    offset: int = Query(default=0, ge=0, le=200000),
     x_user_role: Optional[str] = Header(default=None, alias="X-User-Role"),
 ) -> Dict[str, Any]:
     role = _resolve_role(x_user_role)
@@ -756,8 +905,12 @@ def get_portfolio(
                 or needle in str(record.get("assigned_to") or "").lower()
             ]
 
+    total_records = len(records)
+    slice_start = min(offset, total_records)
+    slice_end = min(slice_start + limit, total_records)
+
     sliced_records = []
-    for record in records[:limit]:
+    for record in records[slice_start:slice_end]:
         compact = dict(record)
         timeline = compact.get("timeline", [])
         compact["timeline_count"] = len(timeline) if isinstance(timeline, list) else 0
@@ -789,18 +942,27 @@ def get_portfolio(
         if records
         else 0.0
     )
+    include_heavy_summary = summary_mode == "full"
 
     return {
         "summary": {
-            "total_records": len(records),
+            "total_records": total_records,
             "high_priority": risk_counts["high"],
             "risk_counts": risk_counts,
+            "risk_deciles": _build_risk_decile_rows(records) if include_heavy_summary else [],
             "workflow_counts": workflow_counts,
             "due_followups": due_followups,
-            "alert_count": len(_build_alerts(records, limit=5000)),
+            "alert_count": len(_build_alerts(records, limit=5000)) if include_heavy_summary else 0,
             "average_risk_score": round(average_score, 2),
+            "summary_mode": summary_mode,
         },
         "records": sliced_records,
+        "pagination": {
+            "offset": slice_start,
+            "limit": limit,
+            "returned_records": len(sliced_records),
+            "has_more": slice_end < total_records,
+        },
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -1144,6 +1306,138 @@ def update_portfolio_workflow(
         "record": record,
         "updated": True,
         "timestamp": _utc_now_iso(),
+    }
+
+
+@app.post("/portfolio/workflow/auto")
+def auto_orchestrate_portfolio_workflow(
+    request: WorkflowAutomationRequest,
+    x_user_role: Optional[str] = Header(default=None, alias="X-User-Role"),
+) -> Dict[str, Any]:
+    role = _resolve_role(x_user_role)
+    _ensure_permission(role, "workflow_update")
+
+    if state.startup_error is not None:
+        raise HTTPException(status_code=503, detail=f"Startup failed: {state.startup_error}")
+    if state.portfolio_records is None:
+        raise HTTPException(status_code=503, detail="Portfolio records are not available yet.")
+
+    records = state.portfolio_records
+    owner_load = _build_auto_owner_load(records)
+    now = datetime.now(timezone.utc)
+
+    candidate_records = [
+        record
+        for record in records
+        if str(record.get("workflow_status", "new")) != "resolved"
+    ]
+
+    if request.scope == "high":
+        candidate_records = [
+            record for record in candidate_records if str(record.get("risk_category", "low")) == "high"
+        ]
+
+    candidate_records.sort(key=lambda item: float(item.get("risk_score", 0.0)), reverse=True)
+
+    summary = {
+        "scope": request.scope,
+        "evaluated": 0,
+        "updated": 0,
+        "unchanged": 0,
+        "skipped_snoozed": 0,
+        "assigned": 0,
+        "escalated": 0,
+        "followups_scheduled": 0,
+        "snoozed": 0,
+        "dry_run": request.dry_run,
+    }
+
+    preview: list[Dict[str, Any]] = []
+
+    for record in candidate_records:
+        if summary["evaluated"] >= request.limit:
+            break
+
+        snoozed_until = _parse_datetime(record.get("snoozed_until"))
+        if (
+            not request.include_snoozed
+            and snoozed_until is not None
+            and snoozed_until > now
+            and str(record.get("risk_category", "low")) != "high"
+        ):
+            summary["skipped_snoozed"] += 1
+            continue
+
+        summary["evaluated"] += 1
+        plan = _plan_automated_workflow_update(record, owner_load)
+        if not plan["changed"]:
+            summary["unchanged"] += 1
+            continue
+
+        previous_owner = str(record.get("assigned_to") or "").strip() or None
+        previous_status = str(record.get("workflow_status", "new"))
+        previous_follow_up = record.get("follow_up_at")
+
+        summary["updated"] += 1
+        if plan["owner"] != previous_owner:
+            summary["assigned"] += 1
+        if plan["status"] == "escalated" and previous_status != "escalated":
+            summary["escalated"] += 1
+        if plan["follow_up_at"] != previous_follow_up and plan["follow_up_at"] is not None:
+            summary["followups_scheduled"] += 1
+        if plan["status"] == "snoozed" and previous_status != "snoozed":
+            summary["snoozed"] += 1
+
+        preview.append(
+            {
+                "account_id": str(record.get("account_id")),
+                "risk_category": str(record.get("risk_category", "low")),
+                "risk_score": float(record.get("risk_score", 0.0)),
+                "owner": plan["owner"],
+                "status": plan["status"],
+                "follow_up_at": plan["follow_up_at"],
+                "reason": plan["reason"],
+            }
+        )
+
+        if request.dry_run:
+            continue
+
+        record["assigned_to"] = plan["owner"]
+        record["workflow_status"] = plan["status"]
+        record["follow_up_at"] = plan["follow_up_at"]
+        record["snoozed_until"] = plan["snoozed_until"]
+        record["last_updated_at"] = _utc_now_iso()
+        record["recommended_action"] = _portfolio_action_recommendation(record)
+
+        actor = str(plan["owner"] or "workflow_automation")
+        change_notes = []
+        if plan["owner"] != previous_owner:
+            change_notes.append(f"owner: {previous_owner or 'unassigned'} -> {plan['owner']}")
+        if plan["status"] != previous_status:
+            change_notes.append(f"status: {previous_status} -> {plan['status']}")
+        if plan["follow_up_at"] != previous_follow_up and plan["follow_up_at"] is not None:
+            change_notes.append(f"follow-up: {plan['follow_up_at']}")
+
+        description = "Auto workflow update"
+        if change_notes:
+            description += f" ({'; '.join(change_notes)})"
+        description += f". Policy: {plan['reason']}."
+
+        _append_timeline_event(
+            record=record,
+            event_type="automation",
+            description=description,
+            actor=actor,
+        )
+
+    if not request.dry_run and summary["updated"]:
+        _save_workflow_state(records)
+
+    return {
+        "summary": summary,
+        "preview": preview[:80],
+        "generated_at": _utc_now_iso(),
     }
 
 

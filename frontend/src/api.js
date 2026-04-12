@@ -1,4 +1,5 @@
 const API_BASE_URL = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
+const REQUEST_TIMEOUT_MS = 15000;
 
 const ROLE_STORAGE_KEY = "app_user_role";
 
@@ -20,15 +21,28 @@ async function request(path, options = {}) {
   const isFormData = options.body instanceof FormData;
   const baseHeaders = isFormData ? {} : { "Content-Type": "application/json" };
   const roleHeader = { "X-User-Role": getUserRole() };
+  const controller = new AbortController();
+  const timeoutHandle = globalThis.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
-  const response = await fetch(`${API_BASE_URL}${path}`, {
-    headers: {
-      ...baseHeaders,
-      ...roleHeader,
-      ...(options.headers || {}),
-    },
-    ...options,
-  });
+  let response;
+  try {
+    response = await fetch(`${API_BASE_URL}${path}`, {
+      headers: {
+        ...baseHeaders,
+        ...roleHeader,
+        ...(options.headers || {}),
+      },
+      ...options,
+      signal: controller.signal,
+    });
+  } catch (requestError) {
+    if (requestError?.name === "AbortError") {
+      throw new Error("Request timed out. Please try again.");
+    }
+    throw requestError;
+  } finally {
+    globalThis.clearTimeout(timeoutHandle);
+  }
 
   const payload = await response.json().catch(() => ({}));
 
@@ -65,7 +79,7 @@ export function promoteModelVersion(payload) {
   });
 }
 
-export function fetchPortfolio({ risk, status, search, limit = 300 } = {}) {
+export function fetchPortfolio({ risk, status, search, limit = 300, offset = 0, summaryMode = "full" } = {}) {
   const params = new URLSearchParams();
   if (risk) {
     params.set("risk", risk);
@@ -79,6 +93,12 @@ export function fetchPortfolio({ risk, status, search, limit = 300 } = {}) {
   if (limit) {
     params.set("limit", String(limit));
   }
+  if (offset !== undefined && offset !== null) {
+    params.set("offset", String(offset));
+  }
+  if (summaryMode) {
+    params.set("summary_mode", String(summaryMode));
+  }
 
   const query = params.toString();
   return request(`/portfolio${query ? `?${query}` : ""}`);
@@ -91,6 +111,13 @@ export function fetchPortfolioAccount(accountId) {
 export function updatePortfolioWorkflow(accountId, payload) {
   return request(`/portfolio/${encodeURIComponent(accountId)}/workflow`, {
     method: "PATCH",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function automatePortfolioWorkflow(payload) {
+  return request("/portfolio/workflow/auto", {
+    method: "POST",
     body: JSON.stringify(payload),
   });
 }

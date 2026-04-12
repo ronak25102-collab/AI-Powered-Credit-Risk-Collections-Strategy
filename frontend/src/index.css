@@ -765,6 +765,20 @@ h3,
   cursor: not-allowed;
 }
 
+.queue-pagination-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.queue-pagination-meta {
+  margin: 0;
+  color: #7a665b;
+  font-size: 0.82rem;
+}
+
 .timeline-shell {
   border: 1px solid #ecd7ca;
   border-radius: 12px;

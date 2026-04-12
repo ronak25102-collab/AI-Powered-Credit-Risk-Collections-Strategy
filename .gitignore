@@ -6,6 +6,7 @@ venv/
 
 # Model artifacts
 backend/*.joblib
+backend/portfolio_workflow_state.json
 
 # Node
 node_modules/

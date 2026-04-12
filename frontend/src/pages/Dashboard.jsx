@@ -55,7 +55,7 @@ export default function Dashboard() {
       try {
         const [insightsResponse, portfolioResponse, alertsResponse] = await Promise.all([
           fetchInsights(),
-          fetchPortfolio({ limit: 400 }),
+          fetchPortfolio({ limit: 400, summaryMode: "full" }),
           fetchAlerts(8),
         ]);
 
@@ -90,7 +90,19 @@ export default function Dashboard() {
   const totalRecords = Number(summary.total_records || 0);
   const refreshedAt = insights?.generated_at || portfolio?.generated_at || null;
 
-  const trendRows = useMemo(() => buildTrendRows(records), [records]);
+  const trendRows = useMemo(() => {
+    const deciles = summary.risk_deciles;
+    if (Array.isArray(deciles) && deciles.length) {
+      return deciles.map((row, index) => ({
+        label: String(row.label || String(index + 1).padStart(2, "0")),
+        low: Number(row.low || 0),
+        medium: Number(row.medium || 0),
+        high: Number(row.high || 0),
+      }));
+    }
+
+    return buildTrendRows(records);
+  }, [summary, records]);
   const actionQueue = useMemo(
     () => records.filter((item) => item.risk_category === "high" && item.workflow_status !== "resolved").slice(0, 6),
     [records]

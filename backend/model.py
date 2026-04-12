@@ -95,15 +95,16 @@ class CreditRiskModel:
         income_norm = (income - 18_000.0) / (250_000.0 - 18_000.0)
         credit_norm = (credit_score - 300.0) / 550.0
         missed_norm = min(missed / 6.0, 1.0)
+        dti_norm = dti / 1.5
 
         index = (
-            0.05
-            + (0.24 * dti)
-            + (0.22 * utilization)
-            + (0.26 * missed_norm)
-            + (0.18 * (1.0 - repayment))
-            + (0.07 * (1.0 - credit_norm))
-            + (0.05 * (1.0 - income_norm))
+            0.03
+            + (0.20 * dti_norm)
+            + (0.18 * utilization)
+            + (0.20 * missed_norm)
+            + (0.17 * (1.0 - repayment))
+            + (0.16 * (1.0 - credit_norm))
+            + (0.09 * (1.0 - income_norm))
         )
         return float(np.clip(index, 0.01, 0.99))
 
@@ -127,21 +128,42 @@ class CreditRiskModel:
         divergence = abs(float(model_probability) - float(business_index))
 
         if self.use_business_calibration:
-            model_weight = 0.35
-            business_weight = 0.65
+            model_weight = 0.30
+            business_weight = 0.70
         else:
-            model_weight = 0.7
-            business_weight = 0.3
+            model_weight = 0.60
+            business_weight = 0.40
+
+        if stress_signals >= 2:
+            model_weight = min(model_weight, 0.52)
+            business_weight = max(business_weight, 0.48)
 
         # In visibly stressed profiles, rely less on a potentially overconfident low model output.
         if stress_signals >= 3:
-            model_weight = min(model_weight, 0.45)
-            business_weight = max(business_weight, 0.55)
+            model_weight = min(model_weight, 0.42)
+            business_weight = max(business_weight, 0.58)
+
+        # Moderate disagreement should already lean toward business calibration.
+        if divergence >= 0.32 and business_index >= 0.55:
+            model_weight = min(model_weight, 0.38)
+            business_weight = max(business_weight, 0.62)
+
+        # Symmetric divergence guard: prevent a single model-side spike from dominating all factors.
+        if divergence >= 0.40 and model_probability >= business_index + 0.12:
+            model_weight = min(model_weight, 0.34)
+            business_weight = max(business_weight, 0.66)
+        elif (
+            divergence >= 0.40
+            and business_index >= model_probability + 0.12
+            and (stress_signals >= 2 or business_index >= 0.58)
+        ):
+            model_weight = min(model_weight, 0.34)
+            business_weight = max(business_weight, 0.66)
 
         # Handle large disagreement by leaning toward business risk calibration.
         if divergence >= 0.45 and business_index >= 0.65:
-            model_weight = min(model_weight, 0.30)
-            business_weight = max(business_weight, 0.70)
+            model_weight = min(model_weight, 0.26)
+            business_weight = max(business_weight, 0.74)
 
         weight_total = model_weight + business_weight
         calibrated_probability = (

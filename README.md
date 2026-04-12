@@ -67,11 +67,16 @@ This project simulates a real-world credit analytics workflow:
   - Returns EDA summaries, feature relationships, model performance, and dashboard chart payloads.
 - `GET /portfolio`
   - Returns portfolio records with filtering (`risk`, `status`, `search`, `limit`) and operational summary (risk counts, workflow counts, due follow-ups).
+  - Supports server-side pagination with `offset` + `limit` for fast queue loading on large datasets.
+  - Supports `summary_mode=light|full` to trade response speed vs heavy summary metrics.
 - `GET /portfolio/{account_id}`
   - Returns full account-level detail, including timeline activity events.
 - `PATCH /portfolio/{account_id}/workflow`
   - Updates workflow state (owner assignment, status, follow-up date, snooze date, and notes).
   - Persists workflow state snapshots in backend storage (`portfolio_workflow_state.json`).
+- `POST /portfolio/workflow/auto`
+  - Runs rule-based workflow automation for high-risk-only or full-queue scope.
+  - Auto-assigns owners, advances workflow status, schedules follow-ups, and writes timeline audit events.
 - `POST /portfolio/batch-score`
   - Uploads CSV/XLSX borrower files and returns scored rows with risk band summary.
 - `GET /alerts`
@@ -114,6 +119,11 @@ frontend/
   - Mark contacted
   - Snooze case
   - Change workflow status
+- Risk Queue performance is optimized with server-side filtering/pagination and debounced search input.
+- Risk Queue includes Auto-Orchestrate controls:
+  - Run automation for high-risk-only or entire queue scope
+  - Auto-balance owner assignment across agent pool
+  - Auto-escalate severe accounts and schedule policy-based follow-ups
 - Borrower timeline panel includes:
   - Event history per account
   - Notes capture with timestamps and actor metadata

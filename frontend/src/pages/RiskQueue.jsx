@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import {
+  automatePortfolioWorkflow,
   batchScorePortfolio,
   fetchPortfolio,
   fetchPortfolioAccount,
@@ -18,6 +19,27 @@ const workflowStatusOptions = [
   { value: "escalated", label: "Escalated" },
   { value: "resolved", label: "Resolved" },
 ];
+
+const PAGE_SIZE = 120;
+const SEARCH_DEBOUNCE_MS = 320;
+const validRiskFilters = new Set(["all", "low", "medium", "high"]);
+const validStatusFilters = new Set(["all", ...workflowStatusOptions.map((option) => option.value)]);
+
+function normalizeRiskFilter(value) {
+  return validRiskFilters.has(String(value || "")) ? String(value) : "all";
+}
+
+function normalizeStatusFilter(value) {
+  return validStatusFilters.has(String(value || "")) ? String(value) : "all";
+}
+
+function normalizePage(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    return 1;
+  }
+  return Math.floor(parsed);
+}
 
 function nextIsoDays(days) {
   const now = new Date();
@@ -74,12 +96,17 @@ function exportCsv(records, filePrefix = "risk_queue", preferredHeaders = []) {
 
 export default function RiskQueue() {
   const [searchParams, setSearchParams] = useSearchParams();
+  const hasLoadedRef = useRef(false);
   const [portfolio, setPortfolio] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState("");
   const [searchInput, setSearchInput] = useState(searchParams.get("search") || "");
-  const [riskFilter, setRiskFilter] = useState("all");
-  const [statusFilter, setStatusFilter] = useState("all");
+  const [debouncedSearch, setDebouncedSearch] = useState((searchParams.get("search") || "").trim());
+  const [riskFilter, setRiskFilter] = useState(normalizeRiskFilter(searchParams.get("risk")));
+  const [statusFilter, setStatusFilter] = useState(normalizeStatusFilter(searchParams.get("status")));
+  const [currentPage, setCurrentPage] = useState(normalizePage(searchParams.get("page")));
+  const [reloadTick, setReloadTick] = useState(0);
   const [operatorName, setOperatorName] = useState("Agent Prime");
   const [activeAccountId, setActiveAccountId] = useState(null);
   const [activeAccount, setActiveAccount] = useState(null);
@@ -90,6 +117,9 @@ export default function RiskQueue() {
   const [batchResult, setBatchResult] = useState(null);
   const [batchLoading, setBatchLoading] = useState(false);
   const [batchError, setBatchError] = useState("");
+  const [automationScope, setAutomationScope] = useState("high");
+  const [automationLoading, setAutomationLoading] = useState(false);
+  const [automationSummary, setAutomationSummary] = useState(null);
 
   function mergeUpdatedRecord(updatedRecord) {
     setPortfolio((previous) => {
@@ -160,16 +190,67 @@ export default function RiskQueue() {
     }
   }
 
+  async function runAutoWorkflow() {
+    setAutomationLoading(true);
+    setAutomationSummary(null);
+    setError("");
+
+    try {
+      const automationResponse = await automatePortfolioWorkflow({
+        scope: automationScope,
+        limit: 10000,
+        include_snoozed: false,
+        dry_run: false,
+      });
+
+      setAutomationSummary(automationResponse.summary || null);
+      setReloadTick((previous) => previous + 1);
+    } catch (apiError) {
+      setError(apiError.message || "Unable to run automated workflow.");
+    } finally {
+      setAutomationLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setDebouncedSearch(searchInput.trim());
+    }, SEARCH_DEBOUNCE_MS);
+
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [searchInput]);
+
   useEffect(() => {
     let isMounted = true;
 
     async function loadPortfolio() {
-      setLoading(true);
+      const offset = Math.max(0, (currentPage - 1) * PAGE_SIZE);
+      const apiRisk = riskFilter === "all" ? undefined : riskFilter;
+      const apiStatus = statusFilter === "all" ? undefined : statusFilter;
+
+      if (hasLoadedRef.current) {
+        setRefreshing(true);
+      } else {
+        setLoading(true);
+      }
+
       setError("");
+
       try {
-        const response = await fetchPortfolio({ limit: 1000 });
+        const response = await fetchPortfolio({
+          risk: apiRisk,
+          status: apiStatus,
+          search: debouncedSearch || undefined,
+          limit: PAGE_SIZE,
+          offset,
+          summaryMode: "light",
+        });
+
         if (isMounted) {
           setPortfolio(response);
+          hasLoadedRef.current = true;
         }
       } catch (apiError) {
         if (isMounted) {
@@ -178,6 +259,7 @@ export default function RiskQueue() {
       } finally {
         if (isMounted) {
           setLoading(false);
+          setRefreshing(false);
         }
       }
     }
@@ -187,7 +269,7 @@ export default function RiskQueue() {
     return () => {
       isMounted = false;
     };
-  }, []);
+  }, [riskFilter, statusFilter, debouncedSearch, currentPage, reloadTick]);
 
   useEffect(() => {
     let isMounted = true;
@@ -222,64 +304,52 @@ export default function RiskQueue() {
     };
   }, [activeAccountId]);
 
-  const baseRecords = portfolio?.records || [];
-
-  const filteredRecords = useMemo(() => {
-    const query = searchInput.trim().toLowerCase();
-
-    return baseRecords.filter((record) => {
-      const riskMatch = riskFilter === "all" || record.risk_category === riskFilter;
-      if (!riskMatch) {
-        return false;
-      }
-
-      const statusMatch = statusFilter === "all" || record.workflow_status === statusFilter;
-      if (!statusMatch) {
-        return false;
-      }
-
-      if (!query) {
-        return true;
-      }
-
-      return (
-        record.account_id.toLowerCase().includes(query)
-        || record.account_name.toLowerCase().includes(query)
-        || record.risk_category.toLowerCase().includes(query)
-        || String(record.workflow_status || "").toLowerCase().includes(query)
-        || String(record.assigned_to || "").toLowerCase().includes(query)
-      );
-    });
-  }, [baseRecords, riskFilter, searchInput, statusFilter]);
+  const pageRecords = portfolio?.records || [];
+  const summary = portfolio?.summary || {};
+  const riskCounts = summary.risk_counts || {};
+  const workflowCounts = summary.workflow_counts || {};
+  const totalRecords = Number(summary.total_records || 0);
+  const totalPages = Math.max(1, Math.ceil(totalRecords / PAGE_SIZE));
+  const rangeStart = totalRecords === 0 ? 0 : (currentPage - 1) * PAGE_SIZE + 1;
+  const rangeEnd = totalRecords === 0 ? 0 : Math.min(currentPage * PAGE_SIZE, totalRecords);
 
   useEffect(() => {
-    const query = searchInput.trim();
-    if (!query) {
-      setSearchParams((previous) => {
-        const next = new URLSearchParams(previous);
-        next.delete("search");
-        return next;
-      });
-      return;
+    if (currentPage > totalPages) {
+      setCurrentPage(totalPages);
     }
+  }, [currentPage, totalPages]);
 
+  useEffect(() => {
     setSearchParams((previous) => {
       const next = new URLSearchParams(previous);
-      next.set("search", query);
+
+      if (searchInput.trim()) {
+        next.set("search", searchInput.trim());
+      } else {
+        next.delete("search");
+      }
+
+      if (riskFilter !== "all") {
+        next.set("risk", riskFilter);
+      } else {
+        next.delete("risk");
+      }
+
+      if (statusFilter !== "all") {
+        next.set("status", statusFilter);
+      } else {
+        next.delete("status");
+      }
+
+      if (currentPage > 1) {
+        next.set("page", String(currentPage));
+      } else {
+        next.delete("page");
+      }
+
       return next;
     });
-  }, [searchInput, setSearchParams]);
-
-  const filteredCounts = useMemo(() => {
-    return {
-      low: filteredRecords.filter((record) => record.risk_category === "low").length,
-      medium: filteredRecords.filter((record) => record.risk_category === "medium").length,
-      high: filteredRecords.filter((record) => record.risk_category === "high").length,
-      contacted: filteredRecords.filter((record) => record.workflow_status === "contacted").length,
-      snoozed: filteredRecords.filter((record) => record.workflow_status === "snoozed").length,
-      resolved: filteredRecords.filter((record) => record.workflow_status === "resolved").length,
-    };
-  }, [filteredRecords]);
+  }, [searchInput, riskFilter, statusFilter, currentPage, setSearchParams]);
 
   const timelineEvents = useMemo(() => {
     if (!activeAccount || !Array.isArray(activeAccount.timeline)) {
@@ -311,7 +381,10 @@ export default function RiskQueue() {
           <input
             className="input-field"
             value={searchInput}
-            onChange={(event) => setSearchInput(event.target.value)}
+            onChange={(event) => {
+              setSearchInput(event.target.value);
+              setCurrentPage(1);
+            }}
             placeholder="Search by account id, borrower name, or risk category"
             aria-label="Search queue"
           />
@@ -319,7 +392,10 @@ export default function RiskQueue() {
           <select
             className="input-field"
             value={riskFilter}
-            onChange={(event) => setRiskFilter(event.target.value)}
+            onChange={(event) => {
+              setRiskFilter(event.target.value);
+              setCurrentPage(1);
+            }}
             aria-label="Filter risk category"
           >
             <option value="all">All Risk Levels</option>
@@ -331,7 +407,10 @@ export default function RiskQueue() {
           <select
             className="input-field"
             value={statusFilter}
-            onChange={(event) => setStatusFilter(event.target.value)}
+            onChange={(event) => {
+              setStatusFilter(event.target.value);
+              setCurrentPage(1);
+            }}
             aria-label="Filter workflow status"
           >
             <option value="all">All Workflow Statuses</option>
@@ -355,6 +434,7 @@ export default function RiskQueue() {
               setSearchInput("");
               setRiskFilter("all");
               setStatusFilter("all");
+              setCurrentPage(1);
             }}
           >
             Clear Filters
@@ -364,7 +444,7 @@ export default function RiskQueue() {
             type="button"
             className="btn-primary rounded-xl px-4 py-2.5"
             onClick={() => exportCsv(
-              filteredRecords,
+              pageRecords,
               "risk_queue",
               [
                 "account_id",
@@ -386,19 +466,58 @@ export default function RiskQueue() {
               ]
             )}
           >
-            Export CSV
+            Export Page CSV
           </button>
         </div>
 
-        <div className="mt-4 flex flex-wrap gap-2">
-          <span className="metric-chip">Visible Accounts: {filteredRecords.length}</span>
-          <span className="metric-chip">High: {filteredCounts.high}</span>
-          <span className="metric-chip">Medium: {filteredCounts.medium}</span>
-          <span className="metric-chip">Low: {filteredCounts.low}</span>
-          <span className="metric-chip">Contacted: {filteredCounts.contacted}</span>
-          <span className="metric-chip">Snoozed: {filteredCounts.snoozed}</span>
-          <span className="metric-chip">Resolved: {filteredCounts.resolved}</span>
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <select
+            className="input-field max-w-[220px]"
+            value={automationScope}
+            onChange={(event) => setAutomationScope(event.target.value)}
+            aria-label="Automation scope"
+          >
+            <option value="high">Automate High Risk Only</option>
+            <option value="all">Automate Entire Queue</option>
+          </select>
+
+          <button
+            type="button"
+            className="btn-secondary rounded-xl px-4 py-2.5"
+            onClick={runAutoWorkflow}
+            disabled={automationLoading}
+          >
+            {automationLoading ? "Running Automation..." : "Auto-Orchestrate"}
+          </button>
+
+          <p className="text-xs text-[#7a665b]">
+            Automation auto-assigns owners, advances status, and schedules follow-ups using risk policy rules.
+          </p>
         </div>
+
+        <div className="mt-4 flex flex-wrap gap-2">
+          <span className="metric-chip">Showing: {rangeStart}-{rangeEnd} of {totalRecords.toLocaleString()}</span>
+          <span className="metric-chip">Page: {currentPage} / {totalPages}</span>
+          <span className="metric-chip">High: {Number(riskCounts.high || 0).toLocaleString()}</span>
+          <span className="metric-chip">Medium: {Number(riskCounts.medium || 0).toLocaleString()}</span>
+          <span className="metric-chip">Low: {Number(riskCounts.low || 0).toLocaleString()}</span>
+          <span className="metric-chip">Contacted: {Number(workflowCounts.contacted || 0).toLocaleString()}</span>
+          <span className="metric-chip">Snoozed: {Number(workflowCounts.snoozed || 0).toLocaleString()}</span>
+          <span className="metric-chip">Resolved: {Number(workflowCounts.resolved || 0).toLocaleString()}</span>
+          {refreshing ? <span className="metric-chip">Refreshing page...</span> : null}
+        </div>
+
+        {automationSummary ? (
+          <div className="mt-3 flex flex-wrap gap-2 rounded-xl border border-orange-300/35 bg-orange-100/65 px-3 py-3 text-xs text-[#6a5448]">
+            <span className="metric-chip">Evaluated: {automationSummary.evaluated}</span>
+            <span className="metric-chip">Updated: {automationSummary.updated}</span>
+            <span className="metric-chip">Assigned: {automationSummary.assigned}</span>
+            <span className="metric-chip">Escalated: {automationSummary.escalated}</span>
+            <span className="metric-chip">Follow-Ups: {automationSummary.followups_scheduled}</span>
+            <span className="metric-chip">Snoozed: {automationSummary.snoozed}</span>
+            <span className="metric-chip">Unchanged: {automationSummary.unchanged}</span>
+          </div>
+        ) : null}
       </GlassCard>
 
       <GlassCard title="Batch Scoring Upload" subtitle="Score uploaded borrower files and export prioritized results">
@@ -462,7 +581,7 @@ export default function RiskQueue() {
               </tr>
             </thead>
             <tbody>
-              {filteredRecords.map((record) => {
+              {pageRecords.map((record) => {
                 const isActive = activeAccountId === record.account_id;
                 const isBusy = Boolean(actionLoadingByAccount[record.account_id]);
 
@@ -557,7 +676,7 @@ export default function RiskQueue() {
                 </tr>
                 );
               })}
-              {!filteredRecords.length ? (
+              {!pageRecords.length ? (
                 <tr>
                   <td colSpan={9} className="py-8 text-center text-sm text-[#7a665b]">
                     No records match the current filters.
@@ -567,6 +686,28 @@ export default function RiskQueue() {
             </tbody>
           </table>
         </div>
+      </div>
+
+      <div className="queue-pagination-row">
+        <button
+          type="button"
+          className="btn-secondary rounded-xl px-4 py-2"
+          disabled={currentPage <= 1 || loading || refreshing}
+          onClick={() => setCurrentPage((previous) => Math.max(1, previous - 1))}
+        >
+          Previous Page
+        </button>
+        <p className="queue-pagination-meta">
+          {totalRecords ? `Viewing ${rangeStart}-${rangeEnd} of ${totalRecords.toLocaleString()} records` : "No records in current filter"}
+        </p>
+        <button
+          type="button"
+          className="btn-secondary rounded-xl px-4 py-2"
+          disabled={currentPage >= totalPages || loading || refreshing}
+          onClick={() => setCurrentPage((previous) => Math.min(totalPages, previous + 1))}
+        >
+          Next Page
+        </button>
       </div>
 
       <GlassCard

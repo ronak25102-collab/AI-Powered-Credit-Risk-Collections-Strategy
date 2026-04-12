@@ -265,7 +265,7 @@ export default function RiskPrediction() {
                   name="income"
                   type="number"
                   min="1"
-                  step="100"
+                  step="1"
                   value={formState.income}
                   onChange={handleChange}
                   required
@@ -290,7 +290,7 @@ export default function RiskPrediction() {
                 name="loan_amount"
                 type="number"
                 min="0"
-                step="100"
+                step="1"
                 value={formState.loan_amount}
                 onChange={handleChange}
                 required
@@ -561,7 +561,7 @@ export default function RiskPrediction() {
                 <input
                   className="input-field"
                   type="number"
-                  step="100"
+                  step="1"
                   name="loan_amount_delta"
                   value={whatIfState.loan_amount_delta}
                   onChange={handleWhatIfChange}
