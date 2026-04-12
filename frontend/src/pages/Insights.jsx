@@ -7,8 +7,11 @@ import {
 } from "../api";
 import FeatureCorrelationChart from "../charts/FeatureCorrelationChart";
 import GlassCard from "../components/GlassCard";
+import SkeletonLoader from "../components/SkeletonLoader";
+import { useToast } from "../components/ToastProvider";
 
 export default function Insights() {
+  const { addToast } = useToast();
   const [insights, setInsights] = useState(null);
   const [monitoring, setMonitoring] = useState(null);
   const [modelVersions, setModelVersions] = useState(null);
@@ -53,7 +56,7 @@ export default function Insights() {
   }, []);
 
   if (loading) {
-    return <div className="glass-card h-72 animate-pulse rounded-2xl" />;
+    return <SkeletonLoader />;
   }
 
   if (error) {
@@ -87,8 +90,10 @@ export default function Insights() {
         challengers: (response.registry || []).filter((item) => item.status === "challenger"),
         registry: response.registry,
       });
+      addToast(`${modelName} promoted to champion`, "success");
     } catch (apiError) {
       setActionError(apiError.message || "Model promotion failed.");
+      addToast(apiError.message || "Promotion failed", "error");
     } finally {
       setPromotionLoading("");
     }

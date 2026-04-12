@@ -8,6 +8,9 @@ import {
   updatePortfolioWorkflow,
 } from "../api";
 import GlassCard from "../components/GlassCard";
+import SkeletonLoader from "../components/SkeletonLoader";
+import TopProgressBar from "../components/TopProgressBar";
+import { useToast } from "../components/ToastProvider";
 
 const workflowStatusOptions = [
   { value: "new", label: "New" },
@@ -95,7 +98,10 @@ function exportCsv(records, filePrefix = "risk_queue", preferredHeaders = []) {
 }
 
 export default function RiskQueue() {
+  const { addToast } = useToast();
   const [searchParams, setSearchParams] = useSearchParams();
+  const [sortColumn, setSortColumn] = useState(null);
+  const [sortDirection, setSortDirection] = useState("asc");
   const hasLoadedRef = useRef(false);
   const [portfolio, setPortfolio] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -169,8 +175,10 @@ export default function RiskQueue() {
       if (response.updated) {
         setReloadTick((previous) => previous + 1);
       }
+      addToast(`Workflow updated for ${accountId}`, "success");
     } catch (apiError) {
       setError(apiError.message || "Unable to update workflow.");
+      addToast(apiError.message || "Workflow update failed", "error");
     } finally {
       setActionLoadingByAccount((previous) => ({ ...previous, [accountId]: false }));
     }
@@ -369,8 +377,38 @@ export default function RiskQueue() {
     return [...activeAccount.timeline].reverse();
   }, [activeAccount]);
 
+  // Sortable records
+  const sortedRecords = useMemo(() => {
+    if (!sortColumn) return pageRecords;
+    return [...pageRecords].sort((a, b) => {
+      let aVal = a[sortColumn];
+      let bVal = b[sortColumn];
+      if (typeof aVal === "string") aVal = aVal.toLowerCase();
+      if (typeof bVal === "string") bVal = bVal.toLowerCase();
+      if (aVal == null) return 1;
+      if (bVal == null) return -1;
+      if (aVal < bVal) return sortDirection === "asc" ? -1 : 1;
+      if (aVal > bVal) return sortDirection === "asc" ? 1 : -1;
+      return 0;
+    });
+  }, [pageRecords, sortColumn, sortDirection]);
+
+  function handleSort(column) {
+    if (sortColumn === column) {
+      setSortDirection((prev) => (prev === "asc" ? "desc" : "asc"));
+    } else {
+      setSortColumn(column);
+      setSortDirection("asc");
+    }
+  }
+
+  function SortArrow({ column }) {
+    if (sortColumn !== column) return <span className="sort-arrow">⇅</span>;
+    return <span className="sort-arrow active">{sortDirection === "asc" ? "↑" : "↓"}</span>;
+  }
+
   if (loading) {
-    return <div className="glass-card h-72 animate-pulse rounded-2xl" />;
+    return <SkeletonLoader />;
   }
 
   if (error) {
@@ -383,6 +421,7 @@ export default function RiskQueue() {
 
   return (
     <div className="space-y-4 fade-up">
+      <TopProgressBar loading={refreshing} />
       <GlassCard
         strong
         title="Operational Risk Queue"
@@ -618,19 +657,19 @@ export default function RiskQueue() {
           <table className="data-table">
             <thead>
               <tr>
-                <th>Account</th>
-                <th>Risk</th>
-                <th>Score</th>
-                <th>Workflow</th>
-                <th>Owner</th>
+                <th className="sortable-th" onClick={() => handleSort("account_name")}>Account <SortArrow column="account_name" /></th>
+                <th className="sortable-th" onClick={() => handleSort("risk_category")}>Risk <SortArrow column="risk_category" /></th>
+                <th className="sortable-th" onClick={() => handleSort("risk_score")}>Score <SortArrow column="risk_score" /></th>
+                <th className="sortable-th" onClick={() => handleSort("workflow_status")}>Workflow <SortArrow column="workflow_status" /></th>
+                <th className="sortable-th" onClick={() => handleSort("assigned_to")}>Owner <SortArrow column="assigned_to" /></th>
                 <th>Follow-Up</th>
                 <th>Metrics</th>
-                <th>Recommended Action</th>
+                <th className="sortable-th" onClick={() => handleSort("recommended_action")}>Recommended Action <SortArrow column="recommended_action" /></th>
                 <th>Actions</th>
               </tr>
             </thead>
             <tbody>
-              {pageRecords.map((record) => {
+              {sortedRecords.map((record) => {
                 const isActive = activeAccountId === record.account_id;
                 const isBusy = Boolean(actionLoadingByAccount[record.account_id]);
 

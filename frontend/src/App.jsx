@@ -2,11 +2,13 @@ import { Navigate, NavLink, Route, Routes, useLocation } from "react-router-dom"
 import NavBar from "./components/NavBar";
 import Dashboard from "./pages/Dashboard";
 import Insights from "./pages/Insights";
+import LandingPage from "./pages/LandingPage";
+import NotFound from "./pages/NotFound";
 import RiskPrediction from "./pages/RiskPrediction";
 import RiskQueue from "./pages/RiskQueue";
 
 const tabs = [
-  { to: "/", label: "Summary" },
+  { to: "/dashboard", label: "Summary" },
   { to: "/risk-queue", label: "Risk Queue" },
   { to: "/prediction", label: "Prediction Studio" },
   { to: "/insights", label: "Model Insights" },
@@ -25,8 +27,39 @@ function pageHeading(pathname) {
   return "Credit Risk Summary";
 }
 
+function isAppRoute(pathname) {
+  return (
+    pathname.startsWith("/dashboard") ||
+    pathname.startsWith("/risk-queue") ||
+    pathname.startsWith("/prediction") ||
+    pathname.startsWith("/insights")
+  );
+}
+
+/**
+ * Wrapper that plays a page-transition animation on route change.
+ */
+function PageTransition({ children }) {
+  const location = useLocation();
+  return (
+    <div key={location.pathname} className="page-transition-enter">
+      {children}
+    </div>
+  );
+}
+
 export default function App() {
   const location = useLocation();
+  const showShell = isAppRoute(location.pathname);
+
+  if (!showShell) {
+    return (
+      <Routes>
+        <Route path="/" element={<LandingPage />} />
+        <Route path="*" element={<NotFound />} />
+      </Routes>
+    );
+  }
 
   return (
     <div className="app-layout">
@@ -49,7 +82,7 @@ export default function App() {
                 key={tab.to}
                 to={tab.to}
                 className={({ isActive }) => ["tab-link", isActive ? "active" : ""].join(" ").trim()}
-                end={tab.to === "/"}
+                end={tab.to === "/dashboard"}
               >
                 {tab.label}
               </NavLink>
@@ -58,13 +91,15 @@ export default function App() {
         </header>
 
         <main className="workspace-content">
-          <Routes>
-            <Route path="/" element={<Dashboard />} />
-            <Route path="/risk-queue" element={<RiskQueue />} />
-            <Route path="/prediction" element={<RiskPrediction />} />
-            <Route path="/insights" element={<Insights />} />
-            <Route path="*" element={<Navigate to="/" replace />} />
-          </Routes>
+          <PageTransition>
+            <Routes>
+              <Route path="/dashboard" element={<Dashboard />} />
+              <Route path="/risk-queue" element={<RiskQueue />} />
+              <Route path="/prediction" element={<RiskPrediction />} />
+              <Route path="/insights" element={<Insights />} />
+              <Route path="*" element={<Navigate to="/dashboard" replace />} />
+            </Routes>
+          </PageTransition>
         </main>
       </section>
     </div>

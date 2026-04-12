@@ -1,9 +1,13 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { fetchAlerts, fetchInsights, fetchPortfolio } from "../api";
 import RiskTrendChart from "../charts/RiskTrendChart";
 import GlassCard from "../components/GlassCard";
 import KpiCard from "../components/KpiCard";
+import SkeletonLoader from "../components/SkeletonLoader";
+import Sparkline from "../components/Sparkline";
+import TopProgressBar from "../components/TopProgressBar";
+import { useToast } from "../components/ToastProvider";
 
 function safePercent(value, total) {
   if (!total) {
@@ -40,47 +44,48 @@ function buildTrendRows(records) {
 }
 
 export default function Dashboard() {
+  const { addToast } = useToast();
   const [insights, setInsights] = useState(null);
   const [portfolio, setPortfolio] = useState(null);
   const [alerts, setAlerts] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState("");
 
-  useEffect(() => {
-    let isMounted = true;
-
-    async function loadData() {
+  const loadData = useCallback(async (isRefresh = false) => {
+    if (isRefresh) {
+      setRefreshing(true);
+    } else {
       setLoading(true);
-      setError("");
-      try {
-        const [insightsResponse, portfolioResponse, alertsResponse] = await Promise.all([
-          fetchInsights(),
-          fetchPortfolio({ limit: 400, summaryMode: "full" }),
-          fetchAlerts(8),
-        ]);
-
-        if (isMounted) {
-          setInsights(insightsResponse);
-          setPortfolio(portfolioResponse);
-          setAlerts(alertsResponse.alerts || []);
-        }
-      } catch (apiError) {
-        if (isMounted) {
-          setError(apiError.message || "Unable to load dashboard data.");
-        }
-      } finally {
-        if (isMounted) {
-          setLoading(false);
-        }
-      }
     }
+    setError("");
+    try {
+      const [insightsResponse, portfolioResponse, alertsResponse] = await Promise.all([
+        fetchInsights(),
+        fetchPortfolio({ limit: 400, summaryMode: "full" }),
+        fetchAlerts(8),
+      ]);
 
-    loadData();
+      setInsights(insightsResponse);
+      setPortfolio(portfolioResponse);
+      setAlerts(alertsResponse.alerts || []);
+      if (isRefresh) {
+        addToast("Dashboard refreshed successfully", "success");
+      }
+    } catch (apiError) {
+      setError(apiError.message || "Unable to load dashboard data.");
+      if (isRefresh) {
+        addToast(apiError.message || "Refresh failed", "error");
+      }
+    } finally {
+      setLoading(false);
+      setRefreshing(false);
+    }
+  }, [addToast]);
 
-    return () => {
-      isMounted = false;
-    };
-  }, []);
+  useEffect(() => {
+    loadData(false);
+  }, [loadData]);
 
   const records = portfolio?.records || [];
   const summary = portfolio?.summary || {};
@@ -103,6 +108,11 @@ export default function Dashboard() {
 
     return buildTrendRows(records);
   }, [summary, records]);
+
+  // Sparkline data derived from trend rows
+  const sparkHighData = useMemo(() => trendRows.map((r) => r.high), [trendRows]);
+  const sparkTotalData = useMemo(() => trendRows.map((r) => r.low + r.medium + r.high), [trendRows]);
+
   const actionQueue = useMemo(
     () => records.filter((item) => item.risk_category === "high" && item.workflow_status !== "resolved").slice(0, 6),
     [records]
@@ -176,7 +186,7 @@ export default function Dashboard() {
   );
 
   if (loading) {
-    return <div className="glass-card h-72 animate-pulse rounded-2xl" />;
+    return <SkeletonLoader />;
   }
 
   if (error) {
@@ -189,6 +199,8 @@ export default function Dashboard() {
 
   return (
     <div className="dashboard-layout space-y-5 fade-up">
+      <TopProgressBar loading={refreshing} />
+
       <GlassCard strong className="dashboard-hero-card">
         <div className="dashboard-hero">
           <div>
@@ -205,34 +217,55 @@ export default function Dashboard() {
             <span className="metric-chip">Decision Threshold: {model.decision_threshold ?? "n/a"}</span>
             <span className="metric-chip">Accuracy: {model.accuracy ?? "n/a"}</span>
             <span className="metric-chip">Refreshed: {refreshedAt ? new Date(refreshedAt).toLocaleString() : "Live"}</span>
+            <button
+              type="button"
+              className="refresh-btn"
+              disabled={refreshing}
+              onClick={() => loadData(true)}
+            >
+              <span className={refreshing ? "spin" : ""}>↻</span>
+              {refreshing ? "Refreshing…" : "Refresh"}
+            </button>
           </div>
         </div>
       </GlassCard>
 
       <div className="dashboard-kpi-grid stagger">
-        <KpiCard
-          title="Total Accounts"
-          value={summary.total_records?.toLocaleString() || "0"}
-          subtext="Borrowers currently monitored"
-        />
-        <KpiCard
-          title="High Priority"
-          value={summary.high_priority?.toLocaleString() || "0"}
-          subtext="Accounts requiring immediate follow-up"
-          accent="text-[#9a4c32]"
-        />
-        <KpiCard
-          title="Average Risk Score"
-          value={summary.average_risk_score ?? "0"}
-          subtext="Portfolio-level risk baseline"
-          accent="text-[#8a5a42]"
-        />
-        <KpiCard
-          title="Due Follow-Ups"
-          value={summary.due_followups?.toLocaleString() || "0"}
-          subtext={`Open contacted: ${(summary.workflow_counts?.contacted ?? 0).toLocaleString()} | Alerts: ${(summary.alert_count ?? 0).toLocaleString()}`}
-          accent="text-[#6f523f]"
-        />
+        <Link to="/risk-queue" className="kpi-link">
+          <KpiCard
+            title="Total Accounts"
+            value={summary.total_records?.toLocaleString() || "0"}
+            subtext="Borrowers currently monitored"
+          >
+            <Sparkline data={sparkTotalData} />
+          </KpiCard>
+        </Link>
+        <Link to="/risk-queue?risk=high" className="kpi-link">
+          <KpiCard
+            title="High Priority"
+            value={summary.high_priority?.toLocaleString() || "0"}
+            subtext="Accounts requiring immediate follow-up"
+            accent="text-[#9a4c32]"
+          >
+            <Sparkline data={sparkHighData} color="#d96036" />
+          </KpiCard>
+        </Link>
+        <Link to="/insights" className="kpi-link">
+          <KpiCard
+            title="Average Risk Score"
+            value={summary.average_risk_score ?? "0"}
+            subtext="Portfolio-level risk baseline"
+            accent="text-[#8a5a42]"
+          />
+        </Link>
+        <Link to="/risk-queue?status=contacted" className="kpi-link">
+          <KpiCard
+            title="Due Follow-Ups"
+            value={summary.due_followups?.toLocaleString() || "0"}
+            subtext={`Open contacted: ${(summary.workflow_counts?.contacted ?? 0).toLocaleString()} | Alerts: ${(summary.alert_count ?? 0).toLocaleString()}`}
+            accent="text-[#6f523f]"
+          />
+        </Link>
       </div>
 
       <div className="dashboard-main-grid">
