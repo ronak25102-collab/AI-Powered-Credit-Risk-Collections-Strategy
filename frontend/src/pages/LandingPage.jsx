@@ -9,7 +9,7 @@ const features = [
     icon: "⟡",
     title: "Real-Time Risk Scoring",
     description:
-      "Multi-model ensemble with calibrated probability, business-risk overrides, and severity-aware categorisation — scoring thousands of borrowers in seconds.",
+      "Model selection with calibrated probability, business-risk overrides, and severity-aware categorisation — scoring thousands of borrowers in seconds.",
   },
   {
     icon: "◉",
@@ -124,13 +124,13 @@ export default function LandingPage() {
               <AnimatedCounter end={3} suffix=" ML Models" />
             </span>
             <span className="landing-stat-chip">
-              <AnimatedCounter end={95} suffix="% Accuracy" />
+              <AnimatedCounter end={3} suffix=" Evaluation Splits" />
             </span>
             <span className="landing-stat-chip">
-              <AnimatedCounter end={5000} suffix="+" prefix="" /> Borrowers
+              <AnimatedCounter end={8} suffix=" Workflow States" />
             </span>
             <span className="landing-stat-chip">
-              <AnimatedCounter end={100} suffix="% Explainable" />
+              Local Sensitivity Explanations
             </span>
           </div>
         </div>

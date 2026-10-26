@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, NavLink, useNavigate, useLocation } from "react-router-dom";
-import { getUserRole, setUserRole } from "../api";
+import { getApiToken, setApiToken, getUserRole, setUserRole } from "../api";
 
 const links = [
   { to: "/dashboard", label: "Dashboard", icon: "▦" },
@@ -13,6 +13,7 @@ export default function NavBar() {
   const navigate = useNavigate();
   const location = useLocation();
   const [quickFind, setQuickFind] = useState("");
+  const [apiToken, updateApiToken] = useState(getApiToken);
   const [role, setRole] = useState("manager");
   const [mobileOpen, setMobileOpen] = useState(false);
   const quickFindRef = useRef(null);
@@ -106,7 +107,7 @@ export default function NavBar() {
         </button>
 
         <div className="role-switcher-shell">
-          <label className="role-switcher-label" htmlFor="role-switcher">Role</label>
+          <label className="role-switcher-label" htmlFor="role-switcher">Local demo role</label>
           <select
             id="role-switcher"
             className="role-switcher-select"
@@ -122,6 +123,17 @@ export default function NavBar() {
             <option value="manager">Manager</option>
           </select>
         </div>
+
+        <form className="role-switcher-shell" onSubmit={(event) => {
+          event.preventDefault();
+          setApiToken(apiToken);
+          window.location.reload();
+        }}>
+          <label className="role-switcher-label" htmlFor="api-token">API token (when required)</label>
+          <input id="api-token" className="input-field" type="password" autoComplete="off"
+            value={apiToken} onChange={(event) => updateApiToken(event.target.value)} />
+          <button className="btn-secondary mt-2 rounded-xl px-3 py-2 text-xs" type="submit">Connect</button>
+        </form>
 
         <nav className="sidebar-nav" aria-label="Primary">
           {links.map((link) => (

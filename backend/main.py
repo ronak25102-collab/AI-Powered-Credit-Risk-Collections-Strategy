@@ -2,17 +2,21 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
+import tempfile
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+from functools import wraps
 from io import BytesIO
 from pathlib import Path
+from threading import RLock
 from typing import Any, Dict, Literal, Optional
+from uuid import uuid4
 
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile, Header
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-
 from data_processing import (
     FEATURE_COLUMNS,
     OPTIONAL_FEATURE_COLUMNS,
@@ -20,7 +24,13 @@ from data_processing import (
     _sanitize_dataframe,
     _standardize_schema,
 )
+from dotenv import load_dotenv
+from fastapi import FastAPI, File, Header, HTTPException, Query, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from model import CreditRiskModel, initialize_model_system
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from starlette.concurrency import run_in_threadpool
 
 WORKFLOW_STATE_PATH = Path(__file__).resolve().parent / "portfolio_workflow_state.json"
 WORKFLOW_STATUS_VALUES = {
@@ -47,13 +57,85 @@ ROLE_PERMISSIONS: Dict[str, set[str]] = {
     },
 }
 
+load_dotenv(Path(__file__).resolve().parent / ".env")
+STATE_LOCK = RLock()
+AUTHENTICATED_ROLE: ContextVar[Optional[str]] = ContextVar(
+    "authenticated_role", default=None
+)
+MAX_UPLOAD_BYTES = 5 * 1024 * 1024
+MAX_UPLOAD_ROWS = 20_000
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    startup_event()
+    yield
+
+
 app = FastAPI(
     title="AI-Powered Credit Risk & Collections Strategy",
     description=(
         "Predict delinquency risk and expose actionable analytics insights for credit collections."
     ),
-    version="1.0.0",
+    version="1.1.0",
+    lifespan=lifespan,
 )
+
+
+@app.middleware("http")
+async def authenticate(request, call_next):
+    if (
+        request.url.path in {"/", "/health", "/docs", "/redoc", "/openapi.json"}
+        or request.method == "OPTIONS"
+    ):
+        return await call_next(request)
+    try:
+        keys = json.loads(os.getenv("CREDIT_RISK_ROLE_KEYS", "{}"))
+        if not isinstance(keys, dict) or any(
+            role not in ROLE_PERMISSIONS or not isinstance(key, str) or len(key) < 16
+            for role, key in keys.items()
+        ):
+            raise ValueError(
+                "Role keys must map known roles to secrets of at least 16 characters."
+            )
+        if len(set(keys.values())) != len(keys):
+            raise ValueError("Each role must have a distinct secret.")
+    except (ValueError, TypeError):
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Invalid server authentication configuration."},
+        )
+    if not keys:
+        if os.getenv("CREDIT_RISK_DEMO_MODE", "").lower() not in {"1", "true"}:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "detail": "Configure CREDIT_RISK_ROLE_KEYS or explicitly enable CREDIT_RISK_DEMO_MODE for local demos."
+                },
+            )
+        return await call_next(request)
+    scheme, _, credential = request.headers.get("Authorization", "").partition(" ")
+    role = next(
+        (
+            role
+            for role, key in keys.items()
+            if scheme.lower() == "bearer"
+            and secrets.compare_digest(credential.encode(), key.encode())
+        ),
+        None,
+    )
+    if role is None:
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Valid bearer credentials are required."},
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    token = AUTHENTICATED_ROLE.set(role)
+    try:
+        return await call_next(request)
+    finally:
+        AUTHENTICATED_ROLE.reset(token)
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -65,6 +147,7 @@ app.add_middleware(
 
 
 class PredictionRequest(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False, extra="forbid")
     income: float = Field(..., gt=0, le=1_000_000)
     income_period: Literal["annual", "monthly"] = "annual"
     credit_score: int = Field(..., ge=300, le=850)
@@ -95,6 +178,22 @@ class WorkflowUpdateRequest(BaseModel):
     snoozed_until: Optional[datetime] = None
     note: Optional[str] = Field(default=None, min_length=1, max_length=500)
 
+    @field_validator("status")
+    @classmethod
+    def reject_null_status(cls, value):
+        if value is None:
+            raise ValueError("Workflow status cannot be null.")
+        return value
+
+    @field_validator("owner", "note")
+    @classmethod
+    def trim_text(cls, value):
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                raise ValueError("Text cannot contain only whitespace.")
+        return value
+
 
 class WorkflowAutomationRequest(BaseModel):
     scope: Literal["high", "all"] = "high"
@@ -104,7 +203,9 @@ class WorkflowAutomationRequest(BaseModel):
 
 
 class ModelPromotionRequest(BaseModel):
-    challenger_model: Literal["logistic_regression", "random_forest", "gradient_boosting"]
+    challenger_model: Literal[
+        "logistic_regression", "random_forest", "gradient_boosting"
+    ]
     rationale: Optional[str] = Field(default=None, max_length=300)
 
 
@@ -127,6 +228,8 @@ def _utc_now_iso() -> str:
 
 
 def _resolve_role(x_user_role: Optional[str]) -> str:
+    if AUTHENTICATED_ROLE.get() is not None:
+        return AUTHENTICATED_ROLE.get()
     if not x_user_role:
         return "manager"
 
@@ -192,7 +295,7 @@ def _load_workflow_state() -> Dict[str, Dict[str, Any]]:
     except (OSError, json.JSONDecodeError):
         return {}
 
-    accounts = payload.get("accounts")
+    accounts = payload.get("accounts") if isinstance(payload, dict) else None
     if isinstance(accounts, dict):
         return accounts
     return {}
@@ -210,11 +313,54 @@ def _save_workflow_state(records: list[Dict[str, Any]]) -> None:
         "accounts": accounts,
     }
 
+    temporary = None
     try:
-        WORKFLOW_STATE_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    except OSError:
-        # Workflow persistence failure should not block API responses.
-        pass
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=WORKFLOW_STATE_PATH.parent,
+            delete=False,
+            suffix=".tmp",
+        ) as handle:
+            temporary = handle.name
+            json.dump(payload, handle, indent=2, allow_nan=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, WORKFLOW_STATE_PATH)
+    except OSError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Workflow state could not be persisted; no changes were applied.",
+        ) from exc
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def serialized_state_change(function):
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        with STATE_LOCK:
+            records = deepcopy(state.portfolio_records)
+            registry = deepcopy(state.model_registry)
+            model, insights = state.model, state.insights
+            try:
+                return function(*args, **kwargs)
+            except Exception:
+                state.portfolio_records = records
+                state.portfolio_index = (
+                    {row["account_id"]: row for row in records}
+                    if records is not None
+                    else None
+                )
+                state.model_registry, state.model, state.insights = (
+                    registry,
+                    model,
+                    insights,
+                )
+                raise
+
+    return wrapped
 
 
 def _apply_saved_workflow_state(
@@ -253,7 +399,10 @@ def _apply_saved_workflow_state(
 
         timeline = snapshot.get("timeline")
         if isinstance(timeline, list):
-            record["timeline"] = [entry for entry in timeline if isinstance(entry, dict)][-80:]
+            record["timeline"] = [
+                entry for entry in timeline if isinstance(entry, dict)
+            ][-80:]
+        record["recommended_action"] = _portfolio_action_recommendation(record)
 
 
 def _normalize_prediction_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -262,12 +411,18 @@ def _normalize_prediction_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     income_value = float(normalized["income"])
     if normalized.get("income_period") == "monthly":
         income_value *= 12.0
+    if not 0 < income_value <= 1_000_000:
+        raise HTTPException(
+            status_code=422, detail="Annualized income must be between 0 and 1,000,000."
+        )
     normalized["income"] = income_value
 
     loan_amount = normalized.get("loan_amount")
     if normalized.get("debt_to_income_ratio") is None:
         if loan_amount is not None:
-            normalized["debt_to_income_ratio"] = float(min(max(loan_amount / max(income_value, 1.0), 0.0), 1.5))
+            normalized["debt_to_income_ratio"] = float(
+                min(max(loan_amount / max(income_value, 1.0), 0.0), 1.5)
+            )
         else:
             raise HTTPException(
                 status_code=422,
@@ -280,7 +435,9 @@ def _normalize_prediction_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     if normalized.get("credit_utilization") is None:
         if loan_amount is not None:
             denominator = max(income_value + loan_amount, 1.0)
-            normalized["credit_utilization"] = float(min(max(loan_amount / denominator, 0.0), 1.0))
+            normalized["credit_utilization"] = float(
+                min(max(loan_amount / denominator, 0.0), 1.0)
+            )
         else:
             raise HTTPException(
                 status_code=422,
@@ -297,7 +454,7 @@ def _normalize_prediction_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 def _portfolio_action_recommendation(record: Dict[str, Any]) -> str:
     workflow_status = str(record.get("workflow_status", "new"))
     if workflow_status == "resolved":
-        return "Case resolved. Continue passive monitoring for recurrence." 
+        return "Case resolved. Continue passive monitoring for recurrence."
     if workflow_status == "snoozed":
         return "Snoozed case. Re-open on snooze expiry with fresh contact attempt."
     if workflow_status == "contacted":
@@ -341,9 +498,15 @@ def _plan_automated_workflow_update(
 
     current_owner = str(record.get("assigned_to") or "").strip() or None
     current_status = str(record.get("workflow_status", "new"))
-    current_follow_up = record.get("follow_up_at") if isinstance(record.get("follow_up_at"), str) else None
+    current_follow_up = (
+        record.get("follow_up_at")
+        if isinstance(record.get("follow_up_at"), str)
+        else None
+    )
     current_snoozed_until = (
-        record.get("snoozed_until") if isinstance(record.get("snoozed_until"), str) else None
+        record.get("snoozed_until")
+        if isinstance(record.get("snoozed_until"), str)
+        else None
     )
 
     risk_category = str(record.get("risk_category", "low"))
@@ -399,7 +562,10 @@ def _plan_automated_workflow_update(
             reasons.append("weekly monitoring")
 
     else:
-        if current_status in {"new", "assigned", "in_progress"} and current_follow_up is None:
+        if (
+            current_status in {"new", "assigned", "in_progress"}
+            and current_follow_up is None
+        ):
             next_status = "snoozed"
             next_snoozed_until = _future_iso(days=14)
             next_follow_up = None
@@ -436,7 +602,7 @@ def _append_timeline_event(
     timestamp = _utc_now_iso()
     timeline.append(
         {
-            "event_id": f"{record['account_id']}-{int(datetime.now(timezone.utc).timestamp() * 1000)}",
+            "event_id": f"{record['account_id']}-{uuid4().hex}",
             "event_type": event_type,
             "description": description,
             "actor": actor,
@@ -450,28 +616,55 @@ def _append_timeline_event(
 
 async def _read_uploaded_tabular_file(file: UploadFile) -> pd.DataFrame:
     filename = str(file.filename or "batch_upload").lower()
-    contents = await file.read()
+    contents = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(contents) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Upload exceeds the 5 MiB limit.")
     if not contents:
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
     try:
-        if filename.endswith(".xlsx") or filename.endswith(".xls"):
-            return pd.read_excel(BytesIO(contents), engine="openpyxl")
+        if contents.startswith(b"PK") or filename.endswith(".xlsx"):
+            return await run_in_threadpool(
+                pd.read_excel,
+                BytesIO(contents),
+                engine="openpyxl",
+                nrows=MAX_UPLOAD_ROWS + 1,
+            )
 
         decoded = contents.decode("utf-8", errors="replace")
         for separator in [",", ";", "\t"]:
-            candidate = pd.read_csv(BytesIO(decoded.encode("utf-8")), sep=separator)
+            candidate = await run_in_threadpool(
+                pd.read_csv,
+                BytesIO(decoded.encode("utf-8")),
+                sep=separator,
+                nrows=MAX_UPLOAD_ROWS + 1,
+            )
             if candidate.shape[1] > 1:
                 return candidate
 
-        return pd.read_csv(BytesIO(decoded.encode("utf-8")))
+        return pd.read_csv(BytesIO(decoded.encode("utf-8")), nrows=MAX_UPLOAD_ROWS + 1)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Unable to parse uploaded file: {exc}") from exc
+        raise HTTPException(
+            status_code=400, detail=f"Unable to parse uploaded file: {exc}"
+        ) from exc
 
 
 def _prepare_batch_dataframe_for_scoring(raw_dataframe: pd.DataFrame) -> pd.DataFrame:
-    standardized = _standardize_schema(raw_dataframe)
-    missing_columns = [column for column in FEATURE_COLUMNS if column not in standardized.columns]
+    if len(raw_dataframe) > MAX_UPLOAD_ROWS:
+        raise HTTPException(
+            status_code=413, detail="Upload exceeds the 20,000-row limit."
+        )
+    if raw_dataframe.empty:
+        raise HTTPException(
+            status_code=422, detail="Upload must contain at least one borrower row."
+        )
+    try:
+        standardized = _standardize_schema(raw_dataframe)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    missing_columns = [
+        column for column in FEATURE_COLUMNS if column not in standardized.columns
+    ]
     if missing_columns:
         raise HTTPException(
             status_code=422,
@@ -484,28 +677,25 @@ def _prepare_batch_dataframe_for_scoring(raw_dataframe: pd.DataFrame) -> pd.Data
     if TARGET_COLUMN not in standardized.columns:
         standardized[TARGET_COLUMN] = np.nan
 
-    selected_columns = FEATURE_COLUMNS + [
-        column for column in OPTIONAL_FEATURE_COLUMNS if column in standardized.columns
-    ] + [TARGET_COLUMN]
+    selected_columns = (
+        FEATURE_COLUMNS
+        + [
+            column
+            for column in OPTIONAL_FEATURE_COLUMNS
+            if column in standardized.columns
+        ]
+        + [TARGET_COLUMN]
+    )
 
     prepared = _sanitize_dataframe(standardized[selected_columns])
 
-    fill_columns = FEATURE_COLUMNS + [
-        column for column in OPTIONAL_FEATURE_COLUMNS if column in prepared.columns
-    ]
-    for column in fill_columns:
-        median_value = float(prepared[column].median(skipna=True))
-        if np.isnan(median_value):
-            if state.model and column in state.model.optional_feature_defaults:
-                median_value = float(state.model.optional_feature_defaults[column])
-            else:
-                median_value = 0.0
-        prepared[column] = prepared[column].fillna(median_value)
-
+    # Reuse training defaults; the other borrowers in an upload must not affect a score.
     return prepared
 
 
-def _build_alerts(records: list[Dict[str, Any]], limit: int = 100) -> list[Dict[str, Any]]:
+def _build_alerts(
+    records: list[Dict[str, Any]], limit: int = 100
+) -> list[Dict[str, Any]]:
     alerts: list[Dict[str, Any]] = []
     now = datetime.now(timezone.utc)
 
@@ -521,7 +711,11 @@ def _build_alerts(records: list[Dict[str, Any]], limit: int = 100) -> list[Dict[
         follow_up_at_raw = record.get("follow_up_at")
         follow_up_at = _parse_datetime(follow_up_at_raw)
 
-        if risk_category == "high" and not assigned_to and workflow_status != "resolved":
+        if (
+            risk_category == "high"
+            and not assigned_to
+            and workflow_status != "resolved"
+        ):
             alerts.append(
                 {
                     "alert_id": f"ALRT-{account_id}-UNASSIGNED",
@@ -536,7 +730,11 @@ def _build_alerts(records: list[Dict[str, Any]], limit: int = 100) -> list[Dict[
                 }
             )
 
-        if follow_up_at is not None and follow_up_at <= now and workflow_status != "resolved":
+        if (
+            follow_up_at is not None
+            and follow_up_at <= now
+            and workflow_status != "resolved"
+        ):
             alerts.append(
                 {
                     "alert_id": f"ALRT-{account_id}-FOLLOWUP-OVERDUE",
@@ -596,13 +794,26 @@ def _build_model_monitoring_snapshot(
     records: list[Dict[str, Any]],
     insights: Dict[str, Any],
 ) -> Dict[str, Any]:
-    model_performance = insights.get("model_performance", {}) if isinstance(insights, dict) else {}
-    statistical_summary = insights.get("statistical_summary", {}) if isinstance(insights, dict) else {}
+    model_performance = (
+        insights.get("model_performance", {}) if isinstance(insights, dict) else {}
+    )
+    statistical_summary = model_performance.get("training_baseline", {})
 
     if records:
-        risk_scores = np.asarray([float(item.get("risk_score", 0.0)) for item in records], dtype=float)
-        high_risk_share = float(np.mean([1.0 if item.get("risk_category") == "high" else 0.0 for item in records]))
-        override_rate = float(np.mean([1.0 if item.get("override_applied") else 0.0 for item in records]))
+        risk_scores = np.asarray(
+            [float(item.get("risk_score", 0.0)) for item in records], dtype=float
+        )
+        high_risk_share = float(
+            np.mean(
+                [
+                    1.0 if item.get("risk_category") == "high" else 0.0
+                    for item in records
+                ]
+            )
+        )
+        override_rate = float(
+            np.mean([1.0 if item.get("override_applied") else 0.0 for item in records])
+        )
     else:
         risk_scores = np.asarray([0.0], dtype=float)
         high_risk_share = 0.0
@@ -610,17 +821,28 @@ def _build_model_monitoring_snapshot(
 
     drift_rows = []
     for feature in FEATURE_COLUMNS:
-        baseline = statistical_summary.get(feature, {}) if isinstance(statistical_summary, dict) else {}
+        baseline = (
+            statistical_summary.get(feature, {})
+            if isinstance(statistical_summary, dict)
+            else {}
+        )
         baseline_mean = float(baseline.get("mean", 0.0))
         baseline_std = float(baseline.get("std", 0.0))
 
-        current_values = [float(item.get(feature, 0.0)) for item in records if item.get(feature) is not None]
-        current_mean = float(np.mean(current_values)) if current_values else baseline_mean
+        record_feature = "annual_income" if feature == "income" else feature
+        current_values = [
+            float(item[record_feature])
+            for item in records
+            if item.get(record_feature) is not None
+        ]
+        current_mean = (
+            float(np.mean(current_values)) if current_values else baseline_mean
+        )
 
         if baseline_std > 1e-8:
             drift_z_score = abs(current_mean - baseline_mean) / baseline_std
         else:
-            drift_z_score = 0.0
+            drift_z_score = 0.0 if np.isclose(current_mean, baseline_mean) else 1.0
 
         drift_rows.append(
             {
@@ -629,10 +851,13 @@ def _build_model_monitoring_snapshot(
                 "current_mean": round(current_mean, 6),
                 "z_score": round(float(drift_z_score), 4),
                 "drift_flag": bool(drift_z_score >= 1.0),
+                "observed_count": len(current_values),
             }
         )
 
-    average_drift_z = float(np.mean([row["z_score"] for row in drift_rows])) if drift_rows else 0.0
+    average_drift_z = (
+        float(np.mean([row["z_score"] for row in drift_rows])) if drift_rows else 0.0
+    )
 
     return {
         "timestamp": _utc_now_iso(),
@@ -704,32 +929,22 @@ def _initialize_model_registry(model_metrics: Dict[str, Any]) -> list[Dict[str, 
     return registry
 
 
-def _build_portfolio_records(model: CreditRiskModel, dataset: pd.DataFrame) -> list[Dict[str, Any]]:
-    probabilities = model.score_dataframe(dataset)
-
+def _build_portfolio_records(
+    model: CreditRiskModel, dataset: pd.DataFrame
+) -> list[Dict[str, Any]]:
+    scores = model.score_records(dataset)
     records: list[Dict[str, Any]] = []
-    for index, (row, probability) in enumerate(zip(dataset.to_dict(orient="records"), probabilities), start=1):
-        risk_probability = float(probability)
-        risk_score = float(risk_probability * 100.0)
-
-        category, override_applied, override_reason = model._risk_category(
-            probability=risk_probability,
-            missed_payments=float(row["missed_payments"]),
-        )
-        if override_applied:
-            risk_probability = max(risk_probability, 0.75)
-            risk_score = float(risk_probability * 100.0)
-
+    display = model._base_feature_frame(dataset)
+    display["account_id"] = dataset["account_id"]
+    for index, (row, score) in enumerate(
+        zip(display.to_dict(orient="records"), scores), start=1
+    ):
         annual_income = float(row["income"])
         created_at = _utc_now_iso()
         record = {
-            "account_id": f"ACC-{index:05d}",
+            "account_id": str(row["account_id"]),
             "account_name": f"Borrower {index:05d}",
-            "risk_probability": round(risk_probability, 4),
-            "risk_score": round(risk_score, 2),
-            "risk_category": category,
-            "override_applied": override_applied,
-            "override_reason": override_reason,
+            **score,
             "annual_income": round(annual_income, 2),
             "monthly_income": round(annual_income / 12.0, 2),
             "loan_amount": round(float(row.get("loan_amount", 0.0)), 2),
@@ -754,7 +969,9 @@ def _build_portfolio_records(model: CreditRiskModel, dataset: pd.DataFrame) -> l
     return records
 
 
-def _build_risk_decile_rows(records: list[Dict[str, Any]], bucket_count: int = 10) -> list[Dict[str, Any]]:
+def _build_risk_decile_rows(
+    records: list[Dict[str, Any]], bucket_count: int = 10
+) -> list[Dict[str, Any]]:
     rows = [
         {
             "label": str(index + 1).zfill(2),
@@ -768,7 +985,9 @@ def _build_risk_decile_rows(records: list[Dict[str, Any]], bucket_count: int = 1
     if not records:
         return rows
 
-    sorted_records = sorted(records, key=lambda item: float(item.get("risk_score", 0.0)))
+    sorted_records = sorted(
+        records, key=lambda item: float(item.get("risk_score", 0.0))
+    )
     bucket_size = max(1, (len(sorted_records) + bucket_count - 1) // bucket_count)
 
     for index, record in enumerate(sorted_records):
@@ -781,7 +1000,6 @@ def _build_risk_decile_rows(records: list[Dict[str, Any]], bucket_count: int = 1
     return rows
 
 
-@app.on_event("startup")
 def startup_event() -> None:
     dataset_path = os.getenv("CREDIT_RISK_DATASET")
     try:
@@ -792,8 +1010,7 @@ def startup_event() -> None:
         state.portfolio_records = _build_portfolio_records(state.model, state.dataset)
         _apply_saved_workflow_state(state.portfolio_records, _load_workflow_state())
         state.portfolio_index = {
-            str(record["account_id"]): record
-            for record in state.portfolio_records
+            str(record["account_id"]): record for record in state.portfolio_records
         }
         state.model_registry = _initialize_model_registry(
             state.insights.get("model_performance", {}) if state.insights else {}
@@ -835,26 +1052,32 @@ def health() -> Dict[str, Any]:
 
 
 @app.get("/auth/roles")
-def get_auth_roles(x_user_role: Optional[str] = Header(default=None, alias="X-User-Role")) -> Dict[str, Any]:
+def get_auth_roles(
+    x_user_role: Optional[str] = Header(default=None, alias="X-User-Role"),
+) -> Dict[str, Any]:
     resolved_role = _resolve_role(x_user_role)
     return {
         "current_role": resolved_role,
+        "auth_mode": "bearer" if AUTHENTICATED_ROLE.get() else "local_demo",
         "permissions": sorted(ROLE_PERMISSIONS.get(resolved_role, set())),
         "available_roles": {
-            role: sorted(permissions)
-            for role, permissions in ROLE_PERMISSIONS.items()
+            role: sorted(permissions) for role, permissions in ROLE_PERMISSIONS.items()
         },
         "generated_at": _utc_now_iso(),
     }
 
 
 @app.get("/insights")
-def get_insights(x_user_role: Optional[str] = Header(default=None, alias="X-User-Role")) -> Dict[str, Any]:
+def get_insights(
+    x_user_role: Optional[str] = Header(default=None, alias="X-User-Role"),
+) -> Dict[str, Any]:
     role = _resolve_role(x_user_role)
     _ensure_permission(role, "read")
 
     if state.startup_error is not None:
-        raise HTTPException(status_code=503, detail=f"Startup failed: {state.startup_error}")
+        raise HTTPException(
+            status_code=503, detail=f"Startup failed: {state.startup_error}"
+        )
     if state.insights is None:
         raise HTTPException(status_code=503, detail="Insights are not available yet.")
 
@@ -880,9 +1103,13 @@ def get_portfolio(
     _ensure_permission(role, "read")
 
     if state.startup_error is not None:
-        raise HTTPException(status_code=503, detail=f"Startup failed: {state.startup_error}")
+        raise HTTPException(
+            status_code=503, detail=f"Startup failed: {state.startup_error}"
+        )
     if state.portfolio_records is None:
-        raise HTTPException(status_code=503, detail="Portfolio records are not available yet.")
+        raise HTTPException(
+            status_code=503, detail="Portfolio records are not available yet."
+        )
 
     records = state.portfolio_records
 
@@ -890,7 +1117,9 @@ def get_portfolio(
         records = [record for record in records if record["risk_category"] == risk]
 
     if status is not None:
-        records = [record for record in records if record.get("workflow_status") == status]
+        records = [
+            record for record in records if record.get("workflow_status") == status
+        ]
 
     if search:
         needle = search.strip().lower()
@@ -914,18 +1143,26 @@ def get_portfolio(
         compact = dict(record)
         timeline = compact.get("timeline", [])
         compact["timeline_count"] = len(timeline) if isinstance(timeline, list) else 0
-        compact["latest_event"] = timeline[-1] if isinstance(timeline, list) and timeline else None
+        compact["latest_event"] = (
+            timeline[-1] if isinstance(timeline, list) and timeline else None
+        )
         compact.pop("timeline", None)
         sliced_records.append(compact)
 
     risk_counts = {
         "low": int(sum(1 for record in records if record["risk_category"] == "low")),
-        "medium": int(sum(1 for record in records if record["risk_category"] == "medium")),
+        "medium": int(
+            sum(1 for record in records if record["risk_category"] == "medium")
+        ),
         "high": int(sum(1 for record in records if record["risk_category"] == "high")),
     }
     workflow_counts = {
         workflow_status: int(
-            sum(1 for record in records if record.get("workflow_status") == workflow_status)
+            sum(
+                1
+                for record in records
+                if record.get("workflow_status") == workflow_status
+            )
         )
         for workflow_status in sorted(WORKFLOW_STATUS_VALUES)
     }
@@ -934,7 +1171,11 @@ def get_portfolio(
     due_followups = 0
     for record in records:
         follow_up_at = _parse_datetime(record.get("follow_up_at"))
-        if follow_up_at is not None and follow_up_at <= now and record.get("workflow_status") != "resolved":
+        if (
+            follow_up_at is not None
+            and follow_up_at <= now
+            and record.get("workflow_status") != "resolved"
+        ):
             due_followups += 1
 
     average_score = (
@@ -949,10 +1190,14 @@ def get_portfolio(
             "total_records": total_records,
             "high_priority": risk_counts["high"],
             "risk_counts": risk_counts,
-            "risk_deciles": _build_risk_decile_rows(records) if include_heavy_summary else [],
+            "risk_deciles": _build_risk_decile_rows(records)
+            if include_heavy_summary
+            else [],
             "workflow_counts": workflow_counts,
             "due_followups": due_followups,
-            "alert_count": len(_build_alerts(records, limit=5000)) if include_heavy_summary else 0,
+            "alert_count": len(_build_alerts(records, limit=5000))
+            if include_heavy_summary
+            else 0,
             "average_risk_score": round(average_score, 2),
             "summary_mode": summary_mode,
         },
@@ -976,9 +1221,13 @@ def get_alerts(
     _ensure_permission(role, "read")
 
     if state.startup_error is not None:
-        raise HTTPException(status_code=503, detail=f"Startup failed: {state.startup_error}")
+        raise HTTPException(
+            status_code=503, detail=f"Startup failed: {state.startup_error}"
+        )
     if state.portfolio_records is None:
-        raise HTTPException(status_code=503, detail="Portfolio records are not available yet.")
+        raise HTTPException(
+            status_code=503, detail="Portfolio records are not available yet."
+        )
 
     alerts = _build_alerts(state.portfolio_records, limit=limit)
     severity_counts = {
@@ -998,14 +1247,20 @@ def get_alerts(
 
 
 @app.get("/model-monitoring")
-def get_model_monitoring(x_user_role: Optional[str] = Header(default=None, alias="X-User-Role")) -> Dict[str, Any]:
+def get_model_monitoring(
+    x_user_role: Optional[str] = Header(default=None, alias="X-User-Role"),
+) -> Dict[str, Any]:
     role = _resolve_role(x_user_role)
     _ensure_permission(role, "read")
 
     if state.startup_error is not None:
-        raise HTTPException(status_code=503, detail=f"Startup failed: {state.startup_error}")
+        raise HTTPException(
+            status_code=503, detail=f"Startup failed: {state.startup_error}"
+        )
     if state.portfolio_records is None or state.insights is None:
-        raise HTTPException(status_code=503, detail="Monitoring data is not available yet.")
+        raise HTTPException(
+            status_code=503, detail="Monitoring data is not available yet."
+        )
 
     current_snapshot = _build_model_monitoring_snapshot(
         records=state.portfolio_records,
@@ -1013,7 +1268,9 @@ def get_model_monitoring(x_user_role: Optional[str] = Header(default=None, alias
     )
     _append_monitoring_snapshot(current_snapshot)
 
-    recent_history = state.monitoring_snapshots[-30:] if state.monitoring_snapshots else []
+    recent_history = (
+        state.monitoring_snapshots[-30:] if state.monitoring_snapshots else []
+    )
     return {
         "current": current_snapshot,
         "history": recent_history,
@@ -1022,17 +1279,28 @@ def get_model_monitoring(x_user_role: Optional[str] = Header(default=None, alias
 
 
 @app.get("/model-versions")
-def get_model_versions(x_user_role: Optional[str] = Header(default=None, alias="X-User-Role")) -> Dict[str, Any]:
+def get_model_versions(
+    x_user_role: Optional[str] = Header(default=None, alias="X-User-Role"),
+) -> Dict[str, Any]:
     role = _resolve_role(x_user_role)
     _ensure_permission(role, "read")
 
     if state.startup_error is not None:
-        raise HTTPException(status_code=503, detail=f"Startup failed: {state.startup_error}")
+        raise HTTPException(
+            status_code=503, detail=f"Startup failed: {state.startup_error}"
+        )
     if state.model_registry is None:
-        raise HTTPException(status_code=503, detail="Model registry is not available yet.")
+        raise HTTPException(
+            status_code=503, detail="Model registry is not available yet."
+        )
 
-    champion = next((item for item in state.model_registry if item.get("status") == "champion"), None)
-    challengers = [item for item in state.model_registry if item.get("status") == "challenger"]
+    champion = next(
+        (item for item in state.model_registry if item.get("status") == "champion"),
+        None,
+    )
+    challengers = [
+        item for item in state.model_registry if item.get("status") == "challenger"
+    ]
 
     return {
         "champion": champion,
@@ -1043,6 +1311,7 @@ def get_model_versions(x_user_role: Optional[str] = Header(default=None, alias="
 
 
 @app.post("/model-versions/promote")
+@serialized_state_change
 def promote_model_version(
     request: ModelPromotionRequest,
     x_user_role: Optional[str] = Header(default=None, alias="X-User-Role"),
@@ -1051,37 +1320,58 @@ def promote_model_version(
     _ensure_permission(role, "model_promote")
 
     if state.startup_error is not None:
-        raise HTTPException(status_code=503, detail=f"Startup failed: {state.startup_error}")
+        raise HTTPException(
+            status_code=503, detail=f"Startup failed: {state.startup_error}"
+        )
     if state.model_registry is None:
-        raise HTTPException(status_code=503, detail="Model registry is not available yet.")
+        raise HTTPException(
+            status_code=503, detail="Model registry is not available yet."
+        )
 
     challenger = next(
         (
             item
             for item in state.model_registry
-            if item.get("model_name") == request.challenger_model and item.get("status") == "challenger"
+            if item.get("model_name") == request.challenger_model
+            and item.get("status") == "challenger"
         ),
         None,
     )
     if challenger is None:
-        raise HTTPException(status_code=404, detail=f"Challenger {request.challenger_model} not found.")
+        raise HTTPException(
+            status_code=404, detail=f"Challenger {request.challenger_model} not found."
+        )
 
+    replacement = deepcopy(state.model)
+    replacement.activate_candidate(request.challenger_model)
+    records = _build_portfolio_records(replacement, state.dataset)
+    _apply_saved_workflow_state(
+        records,
+        {
+            row["account_id"]: _serialize_workflow_snapshot(row)
+            for row in state.portfolio_records
+        },
+    )
+    replacement.save()
+    state.model = replacement
+    state.portfolio_records = records
+    state.portfolio_index = {row["account_id"]: row for row in records}
+    state.insights = {**state.insights, "model_performance": replacement.metrics}
+    state.insights["charts"] = {
+        **state.insights["charts"],
+        "risk_distribution": {
+            risk: sum(row["risk_category"] == risk for row in records)
+            for risk in ("low", "medium", "high")
+        },
+    }
+    state.model_registry = _initialize_model_registry(replacement.metrics)
+    challenger = next(
+        item for item in state.model_registry if item["status"] == "champion"
+    )
+    challenger["notes"] = (
+        request.rationale or "Promoted fitted artifact and rescored portfolio."
+    )
     now = _utc_now_iso()
-    for item in state.model_registry:
-        if item.get("status") == "champion":
-            item["status"] = "archived"
-            item["notes"] = f"Archived after promoting {request.challenger_model}."
-            item["updated_at"] = now
-
-    challenger["status"] = "champion"
-    challenger["updated_at"] = now
-    challenger["notes"] = request.rationale or "Promoted from challenger to champion."
-
-    for item in state.model_registry:
-        if item.get("status") == "archived" and item.get("model_name") != request.challenger_model:
-            if item.get("model_name") in {"logistic_regression", "random_forest", "gradient_boosting"}:
-                item["status"] = "challenger"
-
     return {
         "champion": challenger,
         "registry": state.model_registry,
@@ -1099,34 +1389,29 @@ async def batch_score_portfolio(
     _ensure_permission(role, "batch_score")
 
     if state.startup_error is not None:
-        raise HTTPException(status_code=503, detail=f"Startup failed: {state.startup_error}")
+        raise HTTPException(
+            status_code=503, detail=f"Startup failed: {state.startup_error}"
+        )
     if state.model is None:
         raise HTTPException(status_code=503, detail="Model is not ready.")
 
     raw_dataframe = await _read_uploaded_tabular_file(file)
-    prepared_dataframe = _prepare_batch_dataframe_for_scoring(raw_dataframe)
-    probabilities = state.model.score_dataframe(prepared_dataframe)
+    model = state.model
+    prepared_dataframe = await run_in_threadpool(
+        _prepare_batch_dataframe_for_scoring, raw_dataframe
+    )
+    scores = await run_in_threadpool(model.score_records, prepared_dataframe)
+    display = model._base_feature_frame(prepared_dataframe)
 
     scored_records: list[Dict[str, Any]] = []
-    for index, (row, probability) in enumerate(
-        zip(prepared_dataframe.to_dict(orient="records"), probabilities),
+    for index, (row, score) in enumerate(
+        zip(display.to_dict(orient="records"), scores),
         start=1,
     ):
-        risk_probability = float(probability)
-        risk_score = float(risk_probability * 100.0)
-        category, override_applied, override_reason = state.model._risk_category(
-            probability=risk_probability,
-            missed_payments=float(row["missed_payments"]),
-        )
-
         scored_records.append(
             {
                 "row_id": index,
-                "risk_probability": round(risk_probability, 4),
-                "risk_score": round(risk_score, 2),
-                "risk_category": category,
-                "override_applied": override_applied,
-                "override_reason": override_reason,
+                **score,
                 "credit_score": int(round(float(row["credit_score"]))),
                 "income": round(float(row["income"]), 2),
                 "loan_amount": round(float(row.get("loan_amount", 0.0)), 2),
@@ -1142,8 +1427,12 @@ async def batch_score_portfolio(
 
     risk_counts = {
         "low": int(sum(1 for item in scored_records if item["risk_category"] == "low")),
-        "medium": int(sum(1 for item in scored_records if item["risk_category"] == "medium")),
-        "high": int(sum(1 for item in scored_records if item["risk_category"] == "high")),
+        "medium": int(
+            sum(1 for item in scored_records if item["risk_category"] == "medium")
+        ),
+        "high": int(
+            sum(1 for item in scored_records if item["risk_category"] == "high")
+        ),
     }
 
     return {
@@ -1153,7 +1442,9 @@ async def batch_score_portfolio(
             "returned_rows": int(len(clipped_records)),
             "risk_counts": risk_counts,
             "average_risk_score": (
-                round(float(np.mean([item["risk_score"] for item in scored_records])), 2)
+                round(
+                    float(np.mean([item["risk_score"] for item in scored_records])), 2
+                )
                 if scored_records
                 else 0.0
             ),
@@ -1165,12 +1456,16 @@ async def batch_score_portfolio(
 
 def _get_portfolio_record_or_404(account_id: str) -> Dict[str, Any]:
     if state.portfolio_index is None:
-        raise HTTPException(status_code=503, detail="Portfolio records are not available yet.")
+        raise HTTPException(
+            status_code=503, detail="Portfolio records are not available yet."
+        )
 
     normalized_account_id = account_id.strip().upper()
     record = state.portfolio_index.get(normalized_account_id)
     if record is None:
-        raise HTTPException(status_code=404, detail=f"Account {normalized_account_id} not found.")
+        raise HTTPException(
+            status_code=404, detail=f"Account {normalized_account_id} not found."
+        )
     return record
 
 
@@ -1183,7 +1478,9 @@ def get_portfolio_account(
     _ensure_permission(role, "read")
 
     if state.startup_error is not None:
-        raise HTTPException(status_code=503, detail=f"Startup failed: {state.startup_error}")
+        raise HTTPException(
+            status_code=503, detail=f"Startup failed: {state.startup_error}"
+        )
 
     record = _get_portfolio_record_or_404(account_id)
     return {
@@ -1193,6 +1490,7 @@ def get_portfolio_account(
 
 
 @app.patch("/portfolio/{account_id}/workflow")
+@serialized_state_change
 def update_portfolio_workflow(
     account_id: str,
     request: WorkflowUpdateRequest,
@@ -1202,14 +1500,20 @@ def update_portfolio_workflow(
     _ensure_permission(role, "workflow_update")
 
     if state.startup_error is not None:
-        raise HTTPException(status_code=503, detail=f"Startup failed: {state.startup_error}")
+        raise HTTPException(
+            status_code=503, detail=f"Startup failed: {state.startup_error}"
+        )
     if state.portfolio_records is None:
-        raise HTTPException(status_code=503, detail="Portfolio records are not available yet.")
+        raise HTTPException(
+            status_code=503, detail="Portfolio records are not available yet."
+        )
 
     record = _get_portfolio_record_or_404(account_id)
     payload = request.model_dump(exclude_unset=True)
     if not payload:
-        raise HTTPException(status_code=422, detail="No workflow fields were provided to update.")
+        raise HTTPException(
+            status_code=422, detail="No workflow fields were provided to update."
+        )
 
     changed = False
     actor = str(record.get("assigned_to") or "collections_agent")
@@ -1253,7 +1557,11 @@ def update_portfolio_workflow(
 
     if "follow_up_at" in payload:
         follow_up_at = payload["follow_up_at"]
-        follow_up_iso = _coerce_datetime_to_utc_iso(follow_up_at) if follow_up_at is not None else None
+        follow_up_iso = (
+            _coerce_datetime_to_utc_iso(follow_up_at)
+            if follow_up_at is not None
+            else None
+        )
         if follow_up_iso != record.get("follow_up_at"):
             changed = True
             record["follow_up_at"] = follow_up_iso
@@ -1267,7 +1575,11 @@ def update_portfolio_workflow(
 
     if "snoozed_until" in payload:
         snoozed_until = payload["snoozed_until"]
-        snoozed_iso = _coerce_datetime_to_utc_iso(snoozed_until) if snoozed_until is not None else None
+        snoozed_iso = (
+            _coerce_datetime_to_utc_iso(snoozed_until)
+            if snoozed_until is not None
+            else None
+        )
         if snoozed_iso != record.get("snoozed_until"):
             changed = True
             record["snoozed_until"] = snoozed_iso
@@ -1310,6 +1622,7 @@ def update_portfolio_workflow(
 
 
 @app.post("/portfolio/workflow/auto")
+@serialized_state_change
 def auto_orchestrate_portfolio_workflow(
     request: WorkflowAutomationRequest,
     x_user_role: Optional[str] = Header(default=None, alias="X-User-Role"),
@@ -1318,9 +1631,13 @@ def auto_orchestrate_portfolio_workflow(
     _ensure_permission(role, "workflow_update")
 
     if state.startup_error is not None:
-        raise HTTPException(status_code=503, detail=f"Startup failed: {state.startup_error}")
+        raise HTTPException(
+            status_code=503, detail=f"Startup failed: {state.startup_error}"
+        )
     if state.portfolio_records is None:
-        raise HTTPException(status_code=503, detail="Portfolio records are not available yet.")
+        raise HTTPException(
+            status_code=503, detail="Portfolio records are not available yet."
+        )
 
     records = state.portfolio_records
     owner_load = _build_auto_owner_load(records)
@@ -1334,10 +1651,14 @@ def auto_orchestrate_portfolio_workflow(
 
     if request.scope == "high":
         candidate_records = [
-            record for record in candidate_records if str(record.get("risk_category", "low")) == "high"
+            record
+            for record in candidate_records
+            if str(record.get("risk_category", "low")) == "high"
         ]
 
-    candidate_records.sort(key=lambda item: float(item.get("risk_score", 0.0)), reverse=True)
+    candidate_records.sort(
+        key=lambda item: float(item.get("risk_score", 0.0)), reverse=True
+    )
     matched_scope_count = len(candidate_records)
 
     summary = {
@@ -1401,7 +1722,10 @@ def auto_orchestrate_portfolio_workflow(
             summary["assigned"] += 1
         if plan["status"] == "escalated" and previous_status != "escalated":
             summary["escalated"] += 1
-        if plan["follow_up_at"] != previous_follow_up and plan["follow_up_at"] is not None:
+        if (
+            plan["follow_up_at"] != previous_follow_up
+            and plan["follow_up_at"] is not None
+        ):
             summary["followups_scheduled"] += 1
         if plan["status"] == "snoozed" and previous_status != "snoozed":
             summary["snoozed"] += 1
@@ -1433,10 +1757,15 @@ def auto_orchestrate_portfolio_workflow(
         actor = str(plan["owner"] or "workflow_automation")
         change_notes = []
         if plan["owner"] != previous_owner:
-            change_notes.append(f"owner: {previous_owner or 'unassigned'} -> {plan['owner']}")
+            change_notes.append(
+                f"owner: {previous_owner or 'unassigned'} -> {plan['owner']}"
+            )
         if plan["status"] != previous_status:
             change_notes.append(f"status: {previous_status} -> {plan['status']}")
-        if plan["follow_up_at"] != previous_follow_up and plan["follow_up_at"] is not None:
+        if (
+            plan["follow_up_at"] != previous_follow_up
+            and plan["follow_up_at"] is not None
+        ):
             change_notes.append(f"follow-up: {plan['follow_up_at']}")
 
         description = "Auto workflow update"
@@ -1470,13 +1799,18 @@ def predict(
     _ensure_permission(role, "predict")
 
     if state.startup_error is not None:
-        raise HTTPException(status_code=503, detail=f"Startup failed: {state.startup_error}")
+        raise HTTPException(
+            status_code=503, detail=f"Startup failed: {state.startup_error}"
+        )
     if state.model is None:
         raise HTTPException(status_code=503, detail="Model is not ready.")
 
     normalized_payload = _normalize_prediction_payload(request.model_dump())
     prediction = state.model.predict(normalized_payload)
     return {
+        "score_semantics": prediction["score_semantics"],
+        "data_provenance": prediction["data_provenance"],
+        "explanation_method": prediction["explanation_method"],
         "risk_score": prediction["risk_score"],
         "risk_probability": prediction["risk_probability"],
         "model_probability": prediction.get("model_probability"),
@@ -1494,4 +1828,4 @@ def predict(
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)

@@ -456,7 +456,7 @@ export default function RiskPrediction() {
           <div className="rounded-full p-2" style={gaugeStyle}>
             <div className="flex h-36 w-36 items-center justify-center rounded-full border border-orange-200/60 bg-white/95">
               <div>
-                <p className="display-font text-3xl font-semibold">{score.toFixed(1)}%</p>
+                <p className="display-font text-3xl font-semibold">{score.toFixed(1)}/100</p>
                 <p className="text-xs uppercase tracking-[0.2em] text-[var(--text-muted)]">Risk Score</p>
               </div>
             </div>
@@ -470,7 +470,7 @@ export default function RiskPrediction() {
 
           <div className="grid w-full gap-2 text-xs text-[var(--text-muted)] sm:grid-cols-2">
             <p className="rounded-lg border border-orange-300/35 bg-white/80 px-3 py-2">
-              Model Probability: {result?.model_probability ?? "-"}
+              Calibrated Model Probability: {result?.model_probability ?? "-"}
             </p>
             <p className="rounded-lg border border-orange-300/35 bg-white/80 px-3 py-2">
               Business Index: {result?.business_risk_index ?? "-"}
@@ -498,7 +498,8 @@ export default function RiskPrediction() {
 
           {driverRows.length ? (
             <div className="w-full rounded-xl border border-[#ecd8ca] bg-[#fff8f2] p-3 text-left">
-              <h3 className="display-font text-base font-semibold">Top Drivers</h3>
+              <h3 className="display-font text-base font-semibold">Local Model Sensitivity</h3>
+              <p className="mt-1 text-xs text-[var(--text-muted)]">Change in model probability when each input is replaced by its training median. These effects are not additive.</p>
               <div className="mt-2 space-y-2">
                 {driverRows.map((driver) => {
                   const impact = Number(driver.impact) || 0;

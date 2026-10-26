@@ -1,4 +1,4 @@
-const API_BASE_URL = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
+const API_BASE_URL = import.meta.env?.VITE_API_URL || "http://127.0.0.1:8000";
 const REQUEST_TIMEOUT_MS = 15000;
 
 const ROLE_STORAGE_KEY = "app_user_role";
@@ -17,41 +17,44 @@ export function setUserRole(role) {
   window.localStorage.setItem(ROLE_STORAGE_KEY, role);
 }
 
+export function getApiToken() {
+  return typeof window === "undefined" ? "" : window.sessionStorage.getItem("credit_risk_api_token") || "";
+}
+
+export function setApiToken(token) {
+  window.sessionStorage.setItem("credit_risk_api_token", token.trim());
+}
+
 async function request(path, options = {}) {
   const isFormData = options.body instanceof FormData;
-  const baseHeaders = isFormData ? {} : { "Content-Type": "application/json" };
-  const roleHeader = { "X-User-Role": getUserRole() };
+  const token = getApiToken();
   const controller = new AbortController();
   const timeoutHandle = globalThis.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-
-  let response;
   try {
-    response = await fetch(`${API_BASE_URL}${path}`, {
+    const response = await fetch(`${API_BASE_URL}${path}`, {
+      ...options,
       headers: {
-        ...baseHeaders,
-        ...roleHeader,
+        ...(isFormData ? {} : { "Content-Type": "application/json" }),
+        "X-User-Role": getUserRole(),
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
         ...(options.headers || {}),
       },
-      ...options,
       signal: controller.signal,
     });
-  } catch (requestError) {
-    if (requestError?.name === "AbortError") {
-      throw new Error("Request timed out. Please try again.");
+    const payload = await response.json();
+    if (!response.ok) {
+      const detail = Array.isArray(payload.detail)
+        ? payload.detail.map((item) => `${(item.loc || []).slice(1).join(".")}: ${item.msg}`).join("; ")
+        : payload.detail || "Request failed.";
+      throw new Error(detail);
     }
-    throw requestError;
+    return payload;
+  } catch (error) {
+    if (error?.name === "AbortError") throw new Error("Request timed out. Please try again.");
+    throw error;
   } finally {
     globalThis.clearTimeout(timeoutHandle);
   }
-
-  const payload = await response.json().catch(() => ({}));
-
-  if (!response.ok) {
-    const detail = payload.detail || "Request failed.";
-    throw new Error(detail);
-  }
-
-  return payload;
 }
 
 export function fetchInsights() {

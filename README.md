@@ -61,9 +61,9 @@
 
 ## What This Project Does
 
-A **production-grade** credit risk analytics platform that:
+A credit risk analytics and collections decision-support prototype that:
 
-- Ingests financial tabular data from CSV/XLSX/XLS with schema normalization
+- Ingests financial tabular data from CSV/XLSX with schema normalization
 - Performs EDA summaries and interaction diagnostics
 - Trains **3 ML classifiers** and auto-selects the best candidate model
 - Calibrates raw model probability with business-risk logic and stress-aware overrides
@@ -88,7 +88,7 @@ A **production-grade** credit risk analytics platform that:
 ### Landing Page
 - 🎬 **Animated particle background** with peach-tone theme
 - ⌨️ **Typing effect** on hero subtitle
-- 📈 **Animated count-up statistics** (3 ML Models, 95% Accuracy, 5000+ Borrowers)
+- 📈 **Animated count-up statistics** (3 ML Models, 3 evaluation splits, 8 workflow states)
 - 🎨 **Scroll-reveal animations** on feature cards
 
 ### Dashboard
@@ -136,9 +136,9 @@ A **production-grade** credit risk analytics platform that:
 ## System Architecture
 
 ```
-┌─────────────┐     X-User-Role      ┌──────────────────┐
+┌─────────────┐     Bearer token     ┌──────────────────┐
 │   React 18  │ ──────────────────►  │   FastAPI Server  │
-│   (Vite)    │ ◄──────────────────  │   (Python 3.10+)  │
+│   (Vite)    │ ◄──────────────────  │   (Python 3.12+)  │
 └─────────────┘    JSON responses    └──────────────────┘
                                             │
                                      ┌──────┴──────┐
@@ -150,8 +150,8 @@ A **production-grade** credit risk analytics platform that:
 **Startup Flow:**
 1. Resolve dataset path (or fallback to synthetic generation)
 2. Normalize and sanitize schema
-3. Impute missing values
-4. Train models and compute insights
+3. Split labeled data, then learn preprocessing from training rows only
+4. Reuse a compatible cached artifact, or train/calibrate candidates and compute held-out metrics
 5. Build scored portfolio records
 6. Rehydrate persisted workflow state
 
@@ -162,7 +162,7 @@ A **production-grade** credit risk analytics platform that:
 ### Backend
 | Technology | Purpose |
 |---|---|
-| Python 3.10+ | Runtime |
+| Python 3.12+ | Runtime |
 | FastAPI | REST API framework |
 | Pydantic v2 | Request/response validation |
 | scikit-learn | Model training (LR, RF, GBM) |
@@ -210,19 +210,32 @@ A **production-grade** credit risk analytics platform that:
 
 **Candidate models:** Logistic Regression · Random Forest · Gradient Boosting
 
-**Selection strategy:**
-- Train/validation/test split with fixed random seed
-- Validation threshold sweep (0.30–0.70)
-- Best model chosen by validation accuracy + F1, with ROC AUC as tiebreaker
+**Selection and evaluation:**
+- Stratified 64% training / 16% validation / 20% test split with fixed seed.
+- Training-only median imputation, feature defaults, scaling, and directional diagnostics.
+- Three-fold sigmoid calibration inside the training partition; each fold fits its own imputation, feature engineering, and scaler.
+- Validation average precision selects the model, with F1 and ROC AUC as tie breakers.
+- Thresholds maximize validation F1, then balanced accuracy; risk bands use validation scores only.
+- Test metrics include precision, recall, F1, balanced accuracy, ROC AUC, average precision, and Brier score.
+- Calibrated model estimates and business-adjusted scores have separate evaluations and baseline comparisons.
+- Weak validation discrimination and proxy/synthetic labels are surfaced in the UI.
+
+**Data integrity:**
+- The bundled delinquency-labeled dataset takes precedence over the approval dataset. The smaller dataset has weak validation signal; the application does not claim a fixed accuracy.
+- Approval inversion is explicitly labeled `approval_proxy`, never represented as observed delinquency.
+- Missing outcomes are dropped, invalid/nonbinary outcomes fail, and single-class outcomes are never replaced by feature-derived labels.
+- Data provenance identifies the source, target semantics, derived inputs, and removed rows.
+- Stable source-based account IDs preserve workflow associations when rows are reordered. Old positional IDs (`ACC-00001`) are intentionally not attached to new accounts.
+- The model cache fingerprints data, preprocessing/training source, and numerical-library versions. Changes trigger retraining; compatible caches preserve a promoted champion across restart.
 
 **Engineered features:**
 `utilization_dti_interaction` · `payment_stress_index` · `credit_pressure` · `income_buffer` · `credit_income_pressure` · `loan_to_income_ratio_raw` · `experience_credit_buffer`
 
 **Scoring outputs:**
-- `risk_probability`, `risk_score`, `risk_category`
+- `risk_probability` (legacy field for the normalized business-adjusted score), `risk_score` (0-100), `risk_category`
 - `model_probability`, `business_risk_index`
 - `override_applied`, `override_reason`
-- `top_drivers` (SHAP-style directional impacts)
+- `top_drivers` (local median-replacement sensitivity; signed, non-additive, not SHAP)
 - `collections_strategy` (strategy + priority + next steps)
 - `explanation` (plain-language risk summary)
 
@@ -297,7 +310,11 @@ Supports `dry_run` preview mode before applying changes.
 | `agent` | read, predict, workflow_update, batch_score |
 | `manager` | All agent permissions + model_promote |
 
-Role is sent via `X-User-Role` header. Unknown roles or disallowed actions return HTTP 403.
+Protected mode uses `Authorization: Bearer <key>`. Set `CREDIT_RISK_ROLE_KEYS` to a JSON mapping of roles to distinct random secrets of at least 16 characters. Roles are derived on the server; `X-User-Role` cannot elevate access. Enter the corresponding key in the sidebar's API token field; it is kept in session storage, never bundled into frontend code.
+
+Without credentials, API access fails closed. For a local demo only, explicitly set `CREDIT_RISK_DEMO_MODE=1`; this enables the role selector and accepts `X-User-Role`. Configured role keys always take precedence over demo mode. Invalid authentication configuration fails closed. Use HTTPS for protected deployments.
+
+Workflow writes use an in-process lock, atomic file replacement, and rollback on write failure. This is a **single-worker prototype**: use a transactional database/shared state before running multiple workers or replicas. Model artifacts use joblib and must only be loaded from trusted local storage.
 
 ---
 
@@ -305,43 +322,51 @@ Role is sent via `X-User-Role` header. Unknown roles or disallowed actions retur
 
 ### Prerequisites
 
-- Python 3.10+
-- Node.js 18+
+- Python 3.12 (the pinned numerical stack requires 3.12+)
+- Node.js 20+ (CI uses Node.js 22)
 
-### Backend
+### Backend (PowerShell)
 
-```bash
+```powershell
 cd backend
 python -m venv .venv
-.venv\Scripts\activate          # Windows
-# source .venv/bin/activate     # macOS/Linux
-pip install -r requirements.txt
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements-lock.txt
+Copy-Item .env.example .env
+python -m uvicorn main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-Optional dataset override:
-```bash
-set CREDIT_RISK_DATASET=..\loan_risk_prediction_dataset.csv
-```
+The copied `.env` explicitly enables local demo mode. For protected use, disable demo mode and configure `CREDIT_RISK_ROLE_KEYS` as described above. Keep `.env` and tokens out of Git. On macOS/Linux, activate with `source .venv/bin/activate` and copy with `cp .env.example .env`.
+
+`CREDIT_RISK_DATASET` optionally selects a dataset. A missing explicit path is an error. With no override, the bundled delinquency dataset is preferred; synthetic fallback is used only when no candidate data file exists. `backend/.env` is loaded automatically; existing process variables take precedence.
 
 ### Frontend
 
-```bash
+```powershell
 cd frontend
-npm install
-npm run dev
+npm.cmd ci
+npm.cmd run dev
 ```
 
 | Service | URL |
 |---|---|
-| Frontend | `http://localhost:5173` |
+| Frontend | `http://127.0.0.1:5173` |
 | Backend | `http://127.0.0.1:8000` |
 | API Docs | `http://127.0.0.1:8000/docs` |
 
-Optional API target override:
-```bash
-set VITE_API_URL=http://127.0.0.1:8000
+`VITE_API_URL` can override the backend URL. Never put an API secret in a `VITE_*` variable. Servers bind to loopback by default.
+
+### Verification (from repository root)
+
+```powershell
+backend\.venv\Scripts\python.exe -m unittest discover -s backend/tests -v
+npm.cmd --prefix frontend test
+npm.cmd --prefix frontend run build
 ```
+
+GitHub Actions runs backend regression checks, Python lint/format checks, frontend API tests, and the production build on pushes and pull requests. `requirements-lock.txt` captures the verified Python environment; `requirements.txt` lists direct dependency ranges.
+
+Batch uploads accept CSV and XLSX (including workbooks renamed `.csv`), with a 5 MiB file limit and 20,000-row limit. Batch scoring reuses training defaults rather than upload medians. The query `limit` caps returned results, not processing limits. Income in uploads is annual; single predictions can specify annual or monthly income.
 
 ---
 
@@ -353,6 +378,8 @@ set VITE_API_URL=http://127.0.0.1:8000
 │   ├── main.py                     # FastAPI endpoints, RBAC, workflow engine
 │   ├── model.py                    # Training, calibration, explainability
 │   ├── data_processing.py          # Dataset loading, schema mapping, EDA
+│   ├── tests/                      # Data, model, API, auth and persistence regression tests
+│   ├── requirements-lock.txt        # Verified Python dependency versions
 │   └── requirements.txt
 ├── frontend/
 │   ├── public/
@@ -396,7 +423,7 @@ set VITE_API_URL=http://127.0.0.1:8000
 | Queue feels slow | Confirm frontend calls `/portfolio` with `summary_mode=light` |
 | Auto-orchestration shows 0 updates | Check `already_orchestrated` counter — scope may be aligned |
 | Prediction fails with ratio errors | Provide `credit_utilization` + `debt_to_income_ratio`, or `loan_amount` for auto-derivation |
-| Dataset load issues | Verify target file exists; synthetic fallback is used automatically |
+| Dataset load issues | Verify target file exists; an invalid explicit path fails; synthetic fallback only applies when no default file exists |
 | PowerShell blocks npm | Use `npm.cmd run dev` instead |
 
 ---

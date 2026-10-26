@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -49,21 +50,40 @@ WORKSPACE_ROOT = BACKEND_DIR.parent
 DEFAULT_DATA_PATH = BACKEND_DIR / "data" / "credit_risk_dataset.csv"
 DEFAULT_DATA_CANDIDATES = [
     DEFAULT_DATA_PATH,
-    WORKSPACE_ROOT / "loan_risk_prediction_dataset.csv",
     WORKSPACE_ROOT / "Delinquency_prediction_dataset.csv",
     WORKSPACE_ROOT / "delinquency_prediction_dataset.csv",
+    WORKSPACE_ROOT / "loan_risk_prediction_dataset.csv",
 ]
 
 COLUMN_ALIASES = {
     "age": ["age", "applicant_age"],
     "income": ["income", "annual_income", "applicant_income"],
-    "loan_amount": ["loan_amount", "loanamount", "amount", "requested_amount"],
+    "loan_amount": [
+        "loan_amount",
+        "loanamount",
+        "amount",
+        "requested_amount",
+        "loan_balance",
+    ],
     "credit_score": ["credit_score", "creditscore", "fico_score", "cibil_score"],
     "years_experience": ["years_experience", "yearsexperience", "experience_years"],
-    "credit_utilization": ["credit_utilization", "utilization", "credit_utilization_ratio"],
-    "debt_to_income_ratio": ["debt_to_income_ratio", "dti", "debtincome_ratio", "loan_to_income_ratio"],
+    "credit_utilization": [
+        "credit_utilization",
+        "utilization",
+        "credit_utilization_ratio",
+    ],
+    "debt_to_income_ratio": [
+        "debt_to_income_ratio",
+        "dti",
+        "debtincome_ratio",
+        "loan_to_income_ratio",
+    ],
     "missed_payments": ["missed_payments", "missedpayments", "payment_missed_count"],
-    "repayment_history": ["repayment_history", "repaymentratio", "payment_history_ratio"],
+    "repayment_history": [
+        "repayment_history",
+        "repaymentratio",
+        "payment_history_ratio",
+    ],
     "delinquent": [
         "delinquent",
         "delinquent_account",
@@ -98,24 +118,36 @@ def _sigmoid(values: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-values))
 
 
-def generate_synthetic_dataset(sample_size: int = 2500, random_state: int = 42) -> pd.DataFrame:
+def generate_synthetic_dataset(
+    sample_size: int = 2500, random_state: int = 42
+) -> pd.DataFrame:
     rng = np.random.default_rng(random_state)
 
     missed_payments = np.clip(rng.poisson(1.2, sample_size), 0, 12).astype(float)
-    debt_to_income_ratio = np.clip(rng.normal(0.34 + (missed_payments * 0.03), 0.12, sample_size), 0.02, 0.95)
-    credit_utilization = np.clip(rng.beta(2.3, 3.0, sample_size) + (missed_payments * 0.025), 0.03, 0.99)
+    debt_to_income_ratio = np.clip(
+        rng.normal(0.34 + (missed_payments * 0.03), 0.12, sample_size), 0.02, 0.95
+    )
+    credit_utilization = np.clip(
+        rng.beta(2.3, 3.0, sample_size) + (missed_payments * 0.025), 0.03, 0.99
+    )
     repayment_history = np.clip(
         rng.normal(0.9 - (missed_payments * 0.05), 0.1, sample_size),
         0.2,
         1.0,
     )
     credit_score = np.clip(
-        rng.normal(720 - (missed_payments * 24) - (debt_to_income_ratio * 85), 58, sample_size),
+        rng.normal(
+            720 - (missed_payments * 24) - (debt_to_income_ratio * 85), 58, sample_size
+        ),
         300,
         850,
     )
     income = np.clip(
-        rng.normal(72_000 - (missed_payments * 4_300) - (debt_to_income_ratio * 23_000), 18_000, sample_size),
+        rng.normal(
+            72_000 - (missed_payments * 4_300) - (debt_to_income_ratio * 23_000),
+            18_000,
+            sample_size,
+        ),
         18_000,
         250_000,
     )
@@ -167,27 +199,35 @@ def _sanitize_dataframe(dataframe: pd.DataFrame) -> pd.DataFrame:
         column for column in OPTIONAL_FEATURE_COLUMNS if column in sanitized.columns
     ]
     for column in numeric_columns:
-        sanitized[column] = pd.to_numeric(sanitized[column], errors="coerce")
+        sanitized[column] = pd.to_numeric(sanitized[column], errors="coerce").replace(
+            [np.inf, -np.inf], np.nan
+        )
 
     if TARGET_COLUMN not in sanitized.columns:
         sanitized[TARGET_COLUMN] = np.nan
     sanitized[TARGET_COLUMN] = pd.to_numeric(sanitized[TARGET_COLUMN], errors="coerce")
 
     for column, (lower, upper) in BOUNDS.items():
-        if column in sanitized.columns:
+        if column in sanitized.columns and column != TARGET_COLUMN:
             sanitized[column] = sanitized[column].clip(lower=lower, upper=upper)
 
     return sanitized
 
 
 def _normalize_column_name(value: str) -> str:
-    return "".join(character for character in str(value).strip().lower() if character.isalnum())
+    return "".join(
+        character for character in str(value).strip().lower() if character.isalnum()
+    )
 
 
 def _resolve_data_path(data_path: Optional[str]) -> Optional[Path]:
     if data_path:
         requested_path = Path(data_path).expanduser()
-        return requested_path if requested_path.exists() and requested_path.is_file() else None
+        if not requested_path.is_file():
+            raise FileNotFoundError(
+                f"Configured dataset does not exist: {requested_path}"
+            )
+        return requested_path
 
     for candidate in DEFAULT_DATA_CANDIDATES:
         if candidate.exists() and candidate.is_file():
@@ -214,7 +254,7 @@ def _coerce_target_series(target_series: pd.Series, source_column: str) -> pd.Se
 
     if normalized_source in APPROVAL_STYLE_TARGET_COLUMNS:
         if numeric_target.notna().sum() > 0:
-            return 1.0 - numeric_target.clip(lower=0.0, upper=1.0)
+            return 1.0 - numeric_target
 
         normalized_values = target_series.astype(str).str.strip().str.lower()
         mapped = normalized_values.map(
@@ -253,7 +293,9 @@ def _derive_loan_schema_features(
         ["loan_amount", "loanamount", "amount"],
     )
     loan_amount = (
-        pd.to_numeric(loan_amount_source, errors="coerce") if loan_amount_source is not None else None
+        pd.to_numeric(loan_amount_source, errors="coerce")
+        if loan_amount_source is not None
+        else None
     )
 
     years_experience_source = _get_source_series(
@@ -273,14 +315,22 @@ def _derive_loan_schema_features(
         ["employment_type", "employmenttype", "employment_status"],
     )
 
-    income = pd.to_numeric(standardized["income"], errors="coerce") if "income" in standardized.columns else None
+    income = (
+        pd.to_numeric(standardized["income"], errors="coerce")
+        if "income" in standardized.columns
+        else None
+    )
     credit_score = (
         pd.to_numeric(standardized["credit_score"], errors="coerce")
         if "credit_score" in standardized.columns
         else None
     )
 
-    if "debt_to_income_ratio" not in standardized.columns and loan_amount is not None and income is not None:
+    if (
+        "debt_to_income_ratio" not in standardized.columns
+        and loan_amount is not None
+        and income is not None
+    ):
         safe_income = income.where(income > 0.0, np.nan)
         dti = (loan_amount / safe_income).clip(lower=0.0, upper=1.5)
         standardized["debt_to_income_ratio"] = dti
@@ -293,7 +343,9 @@ def _derive_loan_schema_features(
             standardized["credit_utilization"] = utilization
         elif "debt_to_income_ratio" in standardized.columns:
             dti = pd.to_numeric(standardized["debt_to_income_ratio"], errors="coerce")
-            standardized["credit_utilization"] = (dti / (1.0 + dti)).clip(lower=0.0, upper=1.0)
+            standardized["credit_utilization"] = (dti / (1.0 + dti)).clip(
+                lower=0.0, upper=1.0
+            )
 
     if "missed_payments" not in standardized.columns:
         dti = (
@@ -311,9 +363,13 @@ def _derive_loan_schema_features(
         if credit_score is not None:
             score_penalty = ((680.0 - credit_score) / 120.0).clip(lower=0.0, upper=4.0)
 
-        experience_penalty = pd.Series(np.nan, index=source_dataframe.index, dtype=float)
+        experience_penalty = pd.Series(
+            np.nan, index=source_dataframe.index, dtype=float
+        )
         if years_experience is not None:
-            experience_penalty = ((10.0 - years_experience) / 10.0).clip(lower=0.0, upper=3.0)
+            experience_penalty = ((10.0 - years_experience) / 10.0).clip(
+                lower=0.0, upper=3.0
+            )
 
         employment_risk = pd.Series(0.25, index=source_dataframe.index, dtype=float)
         if employment_type is not None:
@@ -382,14 +438,22 @@ def _read_tabular_dataset(dataset_path: Path) -> pd.DataFrame:
     return pd.read_csv(dataset_path, encoding="latin1")
 
 
-def _derive_repayment_history_from_months(dataframe: pd.DataFrame) -> Optional[pd.Series]:
+def _derive_repayment_history_from_months(
+    dataframe: pd.DataFrame,
+) -> Optional[pd.Series]:
     month_columns = [
-        column for column in dataframe.columns if _normalize_column_name(column).startswith("month")
+        column
+        for column in dataframe.columns
+        if _normalize_column_name(column).startswith("month")
     ]
     if not month_columns:
         return None
 
-    month_values = dataframe[month_columns].astype(str).apply(lambda series: series.str.strip().str.lower())
+    month_values = (
+        dataframe[month_columns]
+        .astype(str)
+        .apply(lambda series: series.str.strip().str.lower())
+    )
     month_values = month_values.replace(
         {
             "on-time": 1.0,
@@ -415,6 +479,11 @@ def _standardize_schema(dataframe: pd.DataFrame) -> pd.DataFrame:
         _normalize_column_name(column): column for column in dataframe.columns
     }
 
+    if len(normalized_to_original) != len(dataframe.columns):
+        raise ValueError(
+            "Dataset contains ambiguous duplicate column names after normalization."
+        )
+    target_source = None
     standardized = pd.DataFrame(index=dataframe.index)
     for canonical_name, aliases in COLUMN_ALIASES.items():
         source_column = None
@@ -427,6 +496,7 @@ def _standardize_schema(dataframe: pd.DataFrame) -> pd.DataFrame:
         if source_column is not None:
             source_series = dataframe[source_column]
             if canonical_name == TARGET_COLUMN:
+                target_source = source_column
                 source_series = _coerce_target_series(source_series, source_column)
             standardized[canonical_name] = source_series
 
@@ -441,13 +511,18 @@ def _standardize_schema(dataframe: pd.DataFrame) -> pd.DataFrame:
         standardized=standardized,
     )
 
-    if "repayment_history" not in standardized.columns and "missed_payments" in standardized.columns:
+    if (
+        "repayment_history" not in standardized.columns
+        and "missed_payments" in standardized.columns
+    ):
         missed = pd.to_numeric(standardized["missed_payments"], errors="coerce")
         repayment_history = 0.9 - (missed.clip(lower=0.0, upper=14.0) / 14.0)
 
         if "credit_score" in standardized.columns:
             credit_score = pd.to_numeric(standardized["credit_score"], errors="coerce")
-            credit_bonus = ((credit_score - 650.0) / 700.0).clip(lower=-0.08, upper=0.12)
+            credit_bonus = ((credit_score - 650.0) / 700.0).clip(
+                lower=-0.08, upper=0.12
+            )
             repayment_history = repayment_history + credit_bonus.fillna(0.0)
 
         if "debt_to_income_ratio" in standardized.columns:
@@ -457,6 +532,22 @@ def _standardize_schema(dataframe: pd.DataFrame) -> pd.DataFrame:
 
         standardized["repayment_history"] = repayment_history.clip(0.0, 1.0)
 
+    standardized.attrs["provenance"] = {
+        "target_source": str(target_source) if target_source is not None else None,
+        "target_kind": "approval_proxy"
+        if target_source is not None
+        and _normalize_column_name(target_source) in APPROVAL_STYLE_TARGET_COLUMNS
+        else "observed_delinquency",
+        "derived_features": [
+            column
+            for column in FEATURE_COLUMNS
+            if column in standardized
+            and not any(
+                _normalize_column_name(alias) in normalized_to_original
+                for alias in COLUMN_ALIASES[column]
+            )
+        ],
+    }
     return standardized
 
 
@@ -471,9 +562,18 @@ def load_financial_dataset(
         source_dataframe = _read_tabular_dataset(selected_path)
         dataframe = _standardize_schema(source_dataframe)
     else:
-        dataframe = generate_synthetic_dataset(sample_size=sample_size, random_state=random_state)
+        dataframe = generate_synthetic_dataset(
+            sample_size=sample_size, random_state=random_state
+        )
+        dataframe.attrs["provenance"] = {
+            "target_kind": "synthetic",
+            "target_source": "generated",
+            "derived_features": FEATURE_COLUMNS,
+        }
 
-    missing_columns = [column for column in FEATURE_COLUMNS if column not in dataframe.columns]
+    missing_columns = [
+        column for column in FEATURE_COLUMNS if column not in dataframe.columns
+    ]
     if missing_columns:
         raise ValueError(
             "Dataset missing required feature columns: "
@@ -486,38 +586,48 @@ def load_financial_dataset(
     selected_columns = REQUIRED_COLUMNS + [
         column for column in OPTIONAL_FEATURE_COLUMNS if column in dataframe.columns
     ]
-    return _sanitize_dataframe(dataframe[selected_columns])
+    result = _sanitize_dataframe(dataframe[selected_columns])
+    identifiers = None
+    if selected_path is not None:
+        identifiers = next(
+            (
+                source_dataframe[c]
+                for c in source_dataframe.columns
+                if _normalize_column_name(c)
+                in {"customerid", "accountid", "borrowerid"}
+            ),
+            None,
+        )
+    namespace = selected_path.name if selected_path else "synthetic"
+    identities = []
+    for index, row in result.iterrows():
+        identity = (
+            str(identifiers.loc[index])
+            if identifiers is not None and pd.notna(identifiers.loc[index])
+            else row.drop(TARGET_COLUMN).to_json()
+        )
+        identities.append(
+            "ACC-"
+            + hashlib.sha256(f"{namespace}:{identity}".encode())
+            .hexdigest()[:16]
+            .upper()
+        )
+    result["account_id"] = identities
+    if result["account_id"].duplicated().any():
+        # Identical duplicates may be removed, but conflicting source IDs are unsafe.
+        conflicting = result.drop_duplicates().duplicated(subset=["account_id"])
+        if conflicting.any():
+            raise ValueError("Dataset contains conflicting duplicate account IDs.")
+    result.attrs["provenance"] = {
+        **dataframe.attrs.get("provenance", {}),
+        "source": selected_path.name if selected_path else "synthetic",
+    }
+    return result
 
 
-def _derive_target_from_features(dataframe: pd.DataFrame) -> pd.Series:
-    normalized_missed = _normalize_array(dataframe["missed_payments"].to_numpy(dtype=float))
-    dti = dataframe["debt_to_income_ratio"].to_numpy(dtype=float)
-    utilization = dataframe["credit_utilization"].to_numpy(dtype=float)
-    repayment_inverse = 1.0 - dataframe["repayment_history"].to_numpy(dtype=float)
-
-    credit_score_scaled = (dataframe["credit_score"].to_numpy(dtype=float) - 300.0) / 550.0
-    credit_penalty = 1.0 - np.clip(credit_score_scaled, 0.0, 1.0)
-    income_penalty = 1.0 - _normalize_array(dataframe["income"].to_numpy(dtype=float))
-
-    proxy = (
-        0.28 * normalized_missed
-        + 0.26 * dti
-        + 0.18 * repayment_inverse
-        + 0.12 * utilization
-        + 0.10 * credit_penalty
-        + 0.06 * income_penalty
-    )
-
-    threshold = float(np.quantile(proxy, 0.65))
-    labels = (proxy >= threshold).astype(int)
-
-    if int(np.min(labels)) == int(np.max(labels)):
-        labels = (proxy >= float(np.mean(proxy))).astype(int)
-
-    return pd.Series(labels, index=dataframe.index, dtype=int)
-
-
-def median_impute(dataframe: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Dict[str, Any]]]:
+def median_impute(
+    dataframe: pd.DataFrame,
+) -> Tuple[pd.DataFrame, Dict[str, Dict[str, Any]]]:
     imputed = dataframe.copy()
     report: Dict[str, Dict[str, Any]] = {}
 
@@ -535,37 +645,9 @@ def median_impute(dataframe: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Dict
             "imputed_with_median": median_value,
         }
 
-    target_missing = int(imputed[TARGET_COLUMN].isna().sum())
-    target_non_null = imputed[TARGET_COLUMN].dropna()
-
-    if target_non_null.empty:
-        imputed[TARGET_COLUMN] = _derive_target_from_features(imputed)
-        report[TARGET_COLUMN] = {
-            "missing_before": float(target_missing),
-            "imputed_with_mode": None,
-            "imputation_strategy": "derived_from_features",
-        }
-        return imputed, report
-
-    target_mode = float(target_non_null.mode().iloc[0])
-    if target_missing:
-        imputed[TARGET_COLUMN] = imputed[TARGET_COLUMN].fillna(target_mode)
-
-    imputed[TARGET_COLUMN] = imputed[TARGET_COLUMN].round().astype(int)
-
-    if int(imputed[TARGET_COLUMN].nunique()) < 2:
-        imputed[TARGET_COLUMN] = _derive_target_from_features(imputed)
-        report[TARGET_COLUMN] = {
-            "missing_before": float(target_missing),
-            "imputed_with_mode": target_mode,
-            "imputation_strategy": "fallback_derived_from_features",
-        }
-        return imputed, report
-
     report[TARGET_COLUMN] = {
-        "missing_before": float(target_missing),
-        "imputed_with_mode": target_mode,
-        "imputation_strategy": "mode",
+        "missing_before": int(imputed[TARGET_COLUMN].isna().sum()),
+        "imputation_strategy": "never_impute_labels",
     }
 
     return imputed, report
@@ -573,6 +655,25 @@ def median_impute(dataframe: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Dict
 
 def prepare_dataset(data_path: Optional[str] = None) -> PreparedDataset:
     raw_dataframe = load_financial_dataset(data_path=data_path)
+    invalid_labels = raw_dataframe[TARGET_COLUMN].notna() & ~raw_dataframe[
+        TARGET_COLUMN
+    ].isin([0, 1])
+    if invalid_labels.any():
+        raise ValueError(
+            "Delinquency labels must be binary (0 or 1); invalid labels are not clipped or synthesized."
+        )
+    # Unknown outcomes cannot be training examples. Never manufacture their labels.
+    dropped = int(raw_dataframe[TARGET_COLUMN].isna().sum())
+    raw_dataframe = raw_dataframe.dropna(subset=[TARGET_COLUMN]).copy()
+    if raw_dataframe[TARGET_COLUMN].nunique() != 2:
+        raise ValueError("Training requires observed labels from both classes.")
+    duplicates = int(raw_dataframe.duplicated().sum())
+    raw_dataframe = raw_dataframe.drop_duplicates().reset_index(drop=True)
+    raw_dataframe.attrs["provenance"] = {
+        **raw_dataframe.attrs.get("provenance", {}),
+        "dropped_unlabeled_rows": dropped,
+        "dropped_duplicate_rows": duplicates,
+    }
     cleaned_dataframe, imputation_report = median_impute(raw_dataframe)
 
     return PreparedDataset(
@@ -609,7 +710,9 @@ def _normalize_array(values: np.ndarray) -> np.ndarray:
 
 
 def _risk_proxy_probabilities(dataframe: pd.DataFrame) -> np.ndarray:
-    normalized_missed = _normalize_array(dataframe["missed_payments"].to_numpy(dtype=float))
+    normalized_missed = _normalize_array(
+        dataframe["missed_payments"].to_numpy(dtype=float)
+    )
     utilization = dataframe["credit_utilization"].to_numpy(dtype=float)
     dti = dataframe["debt_to_income_ratio"].to_numpy(dtype=float)
     repayment_inverse = 1.0 - dataframe["repayment_history"].to_numpy(dtype=float)
@@ -661,7 +764,9 @@ def _build_utilization_vs_delinquency(dataframe: pd.DataFrame) -> list[Dict[str,
                 "count": total_count,
                 "delinquent": delinquent_count,
                 "non_delinquent": max(total_count - delinquent_count, 0),
-                "delinquent_rate": round(float(row["mean"]) * 100.0, 2),
+                "delinquent_rate": round(float(row["mean"]) * 100.0, 2)
+                if pd.notna(row["mean"])
+                else 0.0,
             }
         )
 
@@ -673,11 +778,13 @@ def build_insights_payload(
     imputation_report: Dict[str, Dict[str, Any]],
     model_metrics: Optional[Dict[str, Any]] = None,
     predicted_probabilities: Optional[np.ndarray] = None,
+    predicted_categories: Optional[list[str]] = None,
 ) -> Dict[str, Any]:
     correlations = (
         dataframe[FEATURE_COLUMNS + [TARGET_COLUMN]]
         .corr(numeric_only=True)[TARGET_COLUMN]
         .drop(TARGET_COLUMN)
+        .fillna(0.0)
         .to_dict()
     )
 
@@ -688,12 +795,13 @@ def build_insights_payload(
         np.mean([abs(float(correlations[column])) for column in FINANCIAL_FEATURES])
     )
 
-    interaction_mask = (
-        (dataframe["debt_to_income_ratio"] >= 0.45)
-        & (dataframe["missed_payments"] >= 2)
+    interaction_mask = (dataframe["debt_to_income_ratio"] >= 0.45) & (
+        dataframe["missed_payments"] >= 2
     )
     interaction_rate = float(
-        dataframe.loc[interaction_mask, TARGET_COLUMN].mean() if interaction_mask.any() else 0.0
+        dataframe.loc[interaction_mask, TARGET_COLUMN].mean()
+        if interaction_mask.any()
+        else 0.0
     )
     baseline_rate = float(dataframe[TARGET_COLUMN].mean())
 
@@ -702,7 +810,14 @@ def build_insights_payload(
         if predicted_probabilities is not None
         else _risk_proxy_probabilities(dataframe)
     )
-    categories = _categorize_risk(np.asarray(probabilities, dtype=float))
+    probabilities = np.asarray(probabilities, dtype=float)
+    low = float((model_metrics or {}).get("low_risk_threshold", 0.33))
+    high = float((model_metrics or {}).get("high_risk_threshold", 0.67))
+    categories = np.where(
+        probabilities < low, "low", np.where(probabilities <= high, "medium", "high")
+    )
+    if predicted_categories is not None:
+        categories = np.asarray(predicted_categories)
 
     risk_distribution = {
         "low": int(np.sum(categories == "low")),
@@ -712,24 +827,27 @@ def build_insights_payload(
 
     key_insights = [
         (
-            "Behavioral features dominate risk prediction: missed_payments and repayment_history "
-            f"show stronger average correlation ({behavioral_strength:.3f}) than financial metrics "
-            f"({financial_strength:.3f})."
+            f"Average absolute target correlation: behavioral features {behavioral_strength:.3f}; "
+            f"financial features {financial_strength:.3f}. Correlation is not a causal explanation."
         ),
         (
-            "High DTI + missed payments = high risk: customers with debt_to_income_ratio >= 45% "
+            "Observed cohort: customers with debt_to_income_ratio >= 45% "
             f"and 2+ missed payments show {interaction_rate * 100:.1f}% delinquency versus "
             f"{baseline_rate * 100:.1f}% baseline."
         ),
         (
-            "Collections strategy should prioritize behavioral triggers (recent missed payments, "
-            "weak repayment consistency) for early intervention campaigns."
+            "Review validation quality and data provenance before using these scores for collections decisions. "
+            "Business rules and model estimates are evaluated separately."
         ),
     ]
 
     top_features = sorted(
         (
-            {"feature": feature, "correlation": float(value), "abs_correlation": abs(float(value))}
+            {
+                "feature": feature,
+                "correlation": float(value),
+                "abs_correlation": abs(float(value)),
+            }
             for feature, value in correlations.items()
         ),
         key=lambda item: item["abs_correlation"],
@@ -738,11 +856,14 @@ def build_insights_payload(
 
     dashboard_metrics = {
         "total_customers": int(len(dataframe)),
-        "high_risk_pct": round((risk_distribution["high"] / max(len(dataframe), 1)) * 100.0, 2),
+        "high_risk_pct": round(
+            (risk_distribution["high"] / max(len(dataframe), 1)) * 100.0, 2
+        ),
         "avg_credit_score": round(float(dataframe["credit_score"].mean()), 2),
     }
 
     payload: Dict[str, Any] = {
+        "data_provenance": dataframe.attrs.get("provenance", {}),
         "dataset_summary": {
             "total_records": int(len(dataframe)),
             "delinquent_rate": round(float(dataframe[TARGET_COLUMN].mean()) * 100.0, 2),
@@ -750,7 +871,9 @@ def build_insights_payload(
         },
         "statistical_summary": _build_statistical_summary(dataframe),
         "imputation_report": imputation_report,
-        "feature_correlations": {key: round(float(value), 4) for key, value in correlations.items()},
+        "feature_correlations": {
+            key: round(float(value), 4) for key, value in correlations.items()
+        },
         "feature_importance": {
             "behavioral_strength": round(behavioral_strength, 4),
             "financial_strength": round(financial_strength, 4),

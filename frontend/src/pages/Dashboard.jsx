@@ -215,7 +215,7 @@ export default function Dashboard() {
           <div className="dashboard-hero-meta">
             <span className="metric-chip">Model: {model.selected_model || "n/a"}</span>
             <span className="metric-chip">Decision Threshold: {model.decision_threshold ?? "n/a"}</span>
-            <span className="metric-chip">Accuracy: {model.accuracy ?? "n/a"}</span>
+            <span className="metric-chip">Test Average Precision: {model.average_precision ?? "n/a"}</span>
             <span className="metric-chip">Refreshed: {refreshedAt ? new Date(refreshedAt).toLocaleString() : "Live"}</span>
             <button
               type="button"
@@ -229,6 +229,10 @@ export default function Dashboard() {
           </div>
         </div>
       </GlassCard>
+      {(model.quality_warnings || []).map((warning) => (
+        <p key={warning} role="status" className="rounded-xl border border-orange-300/45 bg-orange-100/70 px-4 py-3 text-sm">{warning}</p>
+      ))}
+
 
       <div className="dashboard-kpi-grid stagger">
         <Link to="/risk-queue" className="kpi-link">

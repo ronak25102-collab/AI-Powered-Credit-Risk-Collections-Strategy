@@ -85,6 +85,9 @@ export default function Insights() {
         challenger_model: modelName,
         rationale: "Promoted from Insights workflow panel.",
       });
+      const [refreshedInsights, refreshedMonitoring] = await Promise.all([fetchInsights(), fetchModelMonitoring()]);
+      setInsights(refreshedInsights);
+      setMonitoring(refreshedMonitoring);
       setModelVersions({
         champion: response.champion,
         challengers: (response.registry || []).filter((item) => item.status === "challenger"),
@@ -110,6 +113,20 @@ export default function Insights() {
           The analysis combines behavior-driven risk signals with holdout validation diagnostics so teams can understand
           both why the model predicts risk and how reliable the chosen model is.
         </p>
+      </GlassCard>
+
+      <GlassCard title="Validation and Data Quality" subtitle="Held-out results and data provenance">
+        <div className="space-y-2 text-sm text-[var(--text-main)]">
+          <p>Source: {insights?.data_provenance?.source || "Unknown"} | Target: {insights?.data_provenance?.target_kind || "Unknown"}</p>
+          <p>Derived inputs: {(insights?.data_provenance?.derived_features || []).join(", ") || "None"}</p>
+          <p>Test rows: {insights?.model_performance?.test_size} | Average precision: {insights?.model_performance?.average_precision} | Baseline: {insights?.model_performance?.baseline_metrics?.average_precision}</p>
+          <p>Recall: {insights?.model_performance?.recall} | Precision: {insights?.model_performance?.precision} | Brier score: {insights?.model_performance?.brier_score}</p>
+          <p>Business-rule score F1: {insights?.model_performance?.operational_metrics?.f1_score} | Model F1: {insights?.model_performance?.f1_score}</p>
+          <p>The business-adjusted score is a prioritization score. Predictive metrics measure the calibrated model separately.</p>
+          {(insights?.model_performance?.quality_warnings || []).map((warning) => (
+            <p key={warning} role="status" className="rounded-xl border border-orange-300/45 bg-orange-100/70 px-4 py-3">{warning}</p>
+          ))}
+        </div>
       </GlassCard>
 
       <div className="grid gap-4 md:grid-cols-2 stagger">
@@ -148,7 +165,7 @@ export default function Insights() {
 
         <GlassCard title="Interaction Insight: DTI + Missed Payments">
           <p className="rounded-xl border border-orange-300/45 bg-orange-200/55 px-4 py-3 text-sm text-[#7f4c35]">
-            Elevated DTI with missed payments remains the strongest multi-factor early warning combination.
+            Compare the observed target rate for elevated DTI with missed payments against the portfolio baseline.
           </p>
           <div className="mt-3 space-y-2 text-sm text-[var(--text-main)]">
             <p>
@@ -172,7 +189,7 @@ export default function Insights() {
                 <p className="mt-1 text-[var(--text-muted)]">
                   Validation Accuracy: {stats.validation_accuracy} | Validation F1: {stats.validation_f1_score}
                 </p>
-                <p className="text-[var(--text-muted)]">ROC AUC: {stats.roc_auc} | Threshold: {stats.decision_threshold}</p>
+                <p className="text-[var(--text-muted)]">Average precision: {stats.validation_average_precision} | ROC AUC: {stats.roc_auc} | Threshold: {stats.decision_threshold}</p>
               </div>
             ))}
           </div>
